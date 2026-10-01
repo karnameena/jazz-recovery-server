@@ -6,6 +6,7 @@
     "start": "node src/server.mjs",
     "migrate": "node src/db/migrate.mjs",
     "create-owner": "node src/scripts/create-owner.mjs",
+    "change-owner-password": "node src/scripts/change-owner-password.mjs",
     "create-device": "node src/scripts/create-device.mjs",
     "rotate-device": "node src/scripts/rotate-device.mjs"
   },

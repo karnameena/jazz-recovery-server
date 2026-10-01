@@ -11,7 +11,7 @@ const dbPath = path.isAbsolute(configured) ? configured : path.resolve(serviceRo
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
 export const db = new DatabaseSync(dbPath);
-db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA secure_delete = ON;");
 
 export function applyMigrations() {
   const migrationsDir = path.resolve(serviceRoot, "migrations");
@@ -35,7 +35,9 @@ export function applyMigrations() {
 }
 
 export function cleanupExpiredSessions() {
-  db.prepare("DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP").run();
+  // expires_at is stored as ISO-8601 text while SQLite CURRENT_TIMESTAMP uses
+  // "YYYY-MM-DD HH:MM:SS". Compare parsed dates, not raw strings.
+  db.prepare("DELETE FROM sessions WHERE julianday(expires_at) IS NULL OR julianday(expires_at) <= julianday('now')").run();
 }
 
 export function databasePath() { return dbPath; }
