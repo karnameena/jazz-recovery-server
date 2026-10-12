@@ -1,0 +1,28 @@
+name: Jazz Recovery Server Checks
+on:
+  push:
+    branches: [render-backend]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Ensure deployment does not track private SQLite files
+        shell: bash
+        run: |
+          if git ls-files -- 'data/*' '*.db' '*.db-shm' '*.db-wal' | grep -q .; then
+            echo "ERROR: SQLite database file is tracked in the deployment tree."
+            exit 1
+          fi
+      - name: Install dependencies
+        run: npm install --omit=dev
+      - name: Check backend syntax
+        run: node --check src/server.mjs
+      - name: Test owner auth, command queue and Location Services results
+        run: node --test tests/location-services-readback.test.mjs
