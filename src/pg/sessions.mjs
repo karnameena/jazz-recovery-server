@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { db, cleanupExpiredSessions } from "./database.mjs";
-import { randomToken, tokenHash } from "./password.mjs";
+import { randomToken, tokenHash } from "../auth/password.mjs";
 
 const LEGACY_COOKIE_NAME = "jazz_lost_mode_session";
 const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production" || String(process.env.RENDER || "").toLowerCase() === "true";
