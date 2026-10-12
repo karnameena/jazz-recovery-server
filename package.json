@@ -3,14 +3,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/server.mjs",
+    "start": "node src/entrypoint.mjs",
     "migrate": "node src/db/migrate.mjs",
     "create-owner": "node src/scripts/create-owner.mjs",
     "change-owner-password": "node src/scripts/change-owner-password.mjs",
     "create-device": "node src/scripts/create-device.mjs",
-    "rotate-device": "node src/scripts/rotate-device.mjs"
+    "rotate-device": "node src/scripts/rotate-device.mjs",
+    "start:sqlite": "node src/server.mjs",
+    "pg:migrate": "node src/pg/migrate.mjs",
+    "pg:import": "node src/scripts/import-sqlite-to-postgres.mjs"
   },
   "engines": {
     "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
   }
 }
