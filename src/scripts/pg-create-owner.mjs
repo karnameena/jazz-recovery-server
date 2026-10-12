@@ -9,8 +9,7 @@ async function hiddenQuestion(prompt) {
   output.write(prompt);
   if (!input.isTTY || typeof input.setRawMode !== "function") {
     const rl = readline.createInterface({ input, output });
-    try { return await rl.question(""); } finally { rl.close();   await closeDatabase();
-}
+    try { return await rl.question(""); } finally { rl.close(); }
   }
   return await new Promise((resolve, reject) => {
     let value = "";
@@ -52,4 +51,5 @@ try {
   console.log("Owner created. Plaintext password was never logged and only the scrypt hash was stored.");
 } finally {
   try { rl.close(); } catch {}
+  await closeDatabase();
 }
