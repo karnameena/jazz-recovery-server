@@ -513,7 +513,7 @@ const server = http.createServer(async (req, res) => {
       const mapped = mapCommand(action, body.args || {});
       if (!mapped) return json(req, res, 400, { ok: false, error: action === "PLAY_VOICE_MESSAGE" ? "Invalid or oversized recovery voice message" : "Invalid recovery action arguments" });
 
-      return await db.transaction(async () => {
+      const response = await db.transaction(async () => {
         await db.lockDevice(row.id);
       if (LOCATION_COMMANDS.has(mapped.type)) {
         await expireLocationCommands(row.id);
@@ -522,27 +522,28 @@ const server = http.createServer(async (req, res) => {
             .get(row.id, mapped.type);
           if (conflict) {
             await audit(session.user_id, row.id, action, "CONFLICT");
-            return json(req, res, 409, { ok: false, error: "An opposite Location Services command is already pending. Refresh its result before changing direction." });
+            return { status: 409, body: { ok: false, error: "An opposite Location Services command is already pending. Refresh its result before changing direction." } };
           }
         }
       }
       const existing = await existingPendingCommand(row.id, mapped);
       if (existing) {
         await audit(session.user_id, row.id, action, "COALESCED");
-        return json(req, res, 202, { ok: true, commandId: existing.id, status: "ALREADY_QUEUED", deduplicated: true });
+        return { status: 202, body: { ok: true, commandId: existing.id, status: "ALREADY_QUEUED", deduplicated: true } };
       }
 
       const pending = Number((await db.prepare("SELECT COUNT(*) AS total FROM recovery_commands WHERE device_id=? AND status='pending'").get(row.id))?.total || 0);
       if (pending >= MAX_PENDING_COMMANDS_PER_DEVICE) {
-        return json(req, res, 429, { ok: false, error: "Too many recovery commands are already pending for this device" }, { "Retry-After": "10" });
+        return { status: 429, body: { ok: false, error: "Too many recovery commands are already pending for this device" }, headers: { "Retry-After": "10" } };
       }
 
       const id = crypto.randomUUID();
       await db.prepare("INSERT INTO recovery_commands(id,device_id,type,args_json) VALUES(?,?,?,?)")
         .run(id, row.id, mapped.type, JSON.stringify(mapped.args));
       await audit(session.user_id, row.id, action, "QUEUED");
-      return json(req, res, 202, { ok: true, commandId: id, status: "QUEUED", deduplicated: false });
+      return { status: 202, body: { ok: true, commandId: id, status: "QUEUED", deduplicated: false } };
       });
+      return json(req, res, response.status, response.body, response.headers || {});
     }
 
     // Result is read only by the authenticated owner of the enrolled device.
@@ -617,24 +618,25 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && resultMatch) {
       const device = await authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
-      return await db.transaction(async () => {
+      const body = await readJson(req, 8 * 1024 * 1024);
+      const result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
+      const response = await db.transaction(async () => {
         await db.lockDevice(device.id);
       const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
-      if (!command) return json(req, res, 404, { ok: false, error: "Unknown recovery command" });
+      if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
       if (LOCATION_COMMANDS.has(command.type)) {
         await expireLocationCommands(device.id);
         const refreshed = await db.prepare("SELECT status FROM recovery_commands WHERE id=?").get(command.id);
-        if (refreshed?.status === "expired") return json(req, res, 409, { ok: false, error: "Location Services command expired" });
-        if (refreshed?.status === "done") return json(req, res, 200, { ok: true, deduplicated: true });
+        if (refreshed?.status === "expired") return { status: 409, body: { ok: false, error: "Location Services command expired" } };
+        if (refreshed?.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
       }
-      const body = await readJson(req, 8 * 1024 * 1024);
-      const result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=?")
         .run(JSON.stringify(result), command.id);
       await updateStateFromResult(device, command, result);
       await audit(device.user_id, device.id, command.type.toUpperCase(), result.ok === false ? "FAILED" : "SUCCESS");
-      return json(req, res, 200, { ok: true });
+      return { status: 200, body: { ok: true } };
       });
+      return json(req, res, response.status, response.body);
     }
 
     return json(req, res, 404, { ok: false, error: "Not found" });
