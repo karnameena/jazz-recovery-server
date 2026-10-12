@@ -532,7 +532,7 @@ const server = http.createServer(async (req, res) => {
         return json(req, res, 202, { ok: true, commandId: existing.id, status: "ALREADY_QUEUED", deduplicated: true });
       }
 
-      const pending = Number(await db.prepare("SELECT COUNT(*) AS total FROM recovery_commands WHERE device_id=? AND status='pending'").get(row.id)?.total || 0);
+      const pending = Number((await db.prepare("SELECT COUNT(*) AS total FROM recovery_commands WHERE device_id=? AND status='pending'").get(row.id))?.total || 0);
       if (pending >= MAX_PENDING_COMMANDS_PER_DEVICE) {
         return json(req, res, 429, { ok: false, error: "Too many recovery commands are already pending for this device" }, { "Retry-After": "10" });
       }
@@ -593,11 +593,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && path === "/android/device/commands/next") {
       const device = await authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
-      await expireLocationCommands(device.id);
-      const command = await db.prepare(`SELECT * FROM recovery_commands WHERE device_id=? AND status='pending' AND (leased_until IS NULL OR leased_until<CURRENT_TIMESTAMP) ORDER BY created_at LIMIT 1`).get(device.id);
+      const command = await db.transaction(async () => {
+        await db.lockDevice(device.id);
+        await expireLocationCommands(device.id);
+        const next = await db.prepare(`SELECT * FROM recovery_commands WHERE device_id=? AND status='pending' AND (leased_until IS NULL OR leased_until<CURRENT_TIMESTAMP) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`).get(device.id);
+        if (!next) return null;
+        const leasedUntil = sqliteUtcTimestamp(Date.now() + 30_000);
+        await db.prepare("UPDATE recovery_commands SET leased_until=? WHERE id=?").run(leasedUntil, next.id);
+        return next;
+      });
       if (!command) return json(req, res, 200, { ok: true, command: null });
-      const leasedUntil = sqliteUtcTimestamp(Date.now() + 30_000);
-      await db.prepare("UPDATE recovery_commands SET leased_until=? WHERE id=?").run(leasedUntil, command.id);
       const createdAtMs = sqliteUtcToMs(command.created_at);
       return json(req, res, 200, { ok: true, command: {
         id: command.id, type: command.type, args: JSON.parse(command.args_json || "{}"),
@@ -612,6 +617,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && resultMatch) {
       const device = await authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
+      return await db.transaction(async () => {
+        await db.lockDevice(device.id);
       const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
       if (!command) return json(req, res, 404, { ok: false, error: "Unknown recovery command" });
       if (LOCATION_COMMANDS.has(command.type)) {
@@ -627,6 +634,7 @@ const server = http.createServer(async (req, res) => {
       await updateStateFromResult(device, command, result);
       await audit(device.user_id, device.id, command.type.toUpperCase(), result.ok === false ? "FAILED" : "SUCCESS");
       return json(req, res, 200, { ok: true });
+      });
     }
 
     return json(req, res, 404, { ok: false, error: "Not found" });
