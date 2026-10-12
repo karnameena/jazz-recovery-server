@@ -30,6 +30,27 @@ async function openPort() {
 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+async function runAdmin(command, prompts) {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["src/scripts/dispatch.mjs", command], {
+      cwd: projectRoot, env: { ...envTest, JAZZ_DB_ENGINE: "postgres" },
+      stdio: ["pipe","pipe","pipe"]
+    });
+    let out = "", err = "", index = 0;
+    const watchdog = setTimeout(() => { child.kill(); reject(new Error("Timed out waiting for admin command")); }, 25_000);
+    child.stdout.on("data", text => {
+      out += String(text);
+      while (index < prompts.length && out.includes(prompts[index][0])) {
+        child.stdin.write(prompts[index][1] + "\n");
+        index++;
+      }
+    });
+    child.stderr.on("data", text => err += String(text));
+    child.on("error", error => { clearTimeout(watchdog); reject(error); });
+    child.on("close", code => { clearTimeout(watchdog); resolve({ code, out, err, answered: index }); });
+  });
+}
+
 test("private SQLite import preserves owner/device hashes and recovery API on PostgreSQL", { skip: !local, timeout: 120_000 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jazz-pg-integration-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -172,6 +193,66 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     const forbidden=await api("GET","/api/devices/"+id,null,otherCookie);
     assert.equal(forbidden.status,404,"Another owner must not see this device");
     assert.ok(user2.rows[0].id);
+
+    // The existing npm admin commands must target PostgreSQL when enabled,
+    // including enrolling multiple devices under the SAME owner username.
+    const enrolled = await runAdmin("create-device", [
+      ["Owner username:", "existing-owner"],
+      ["Device ID:", "jazz-tablet-01"],
+      ["Device name [My Mobile]:", "My Tablet"]
+    ]);
+    assert.equal(enrolled.code, 0, "PostgreSQL device enrollment failed: " + enrolled.err);
+    const deviceToken = enrolled.out.match(/Device credential \(shown once\): (\S+)/)?.[1];
+    assert.ok(deviceToken, "Device enrollment token not returned once");
+    assert.notEqual(deviceToken, token, "Devices must have distinct credentials");
+    const ownerDevices = await api("GET", "/api/devices", null, sessionHeaders);
+    assert.equal(ownerDevices.data.items.length, 2, "One owner may manage multiple devices");
+    const tabletAuth = {Authorization: "Bearer " + deviceToken, "X-Jazz-Lost-Device-Id": "jazz-tablet-01"};
+    const tabletHeartbeat = await api("POST","/android/device/heartbeat",{
+      deviceId:"jazz-tablet-01",mode:"NORMAL_MODE",status:{battery:63,network:"WIFI"}
+    },tabletAuth);
+    assert.equal(tabletHeartbeat.status,200,"Tablet credential must authenticate independently");
+
+    const rotate = await runAdmin("rotate-device", [
+      ["Owner username:", "existing-owner"],
+      ["Existing Device ID:", "jazz-tablet-01"]
+    ]);
+    assert.equal(rotate.code,0,"Device credential rotation failed: " + rotate.err);
+    const rotatedToken = rotate.out.match(/NEW device credential \(shown once\): (\S+)/)?.[1];
+    assert.ok(rotatedToken);
+    assert.notEqual(rotatedToken, deviceToken);
+    const oldAuth = await api("POST","/android/device/heartbeat",{
+      deviceId:"jazz-tablet-01",status:{battery:63}
+    },tabletAuth);
+    assert.equal(oldAuth.status,401,"Old device token must be invalidated by rotation");
+    const newAuth = await api("POST","/android/device/heartbeat",{
+      deviceId:"jazz-tablet-01",status:{battery:63}
+    },{Authorization:"Bearer "+rotatedToken,"X-Jazz-Lost-Device-Id":"jazz-tablet-01"});
+    assert.equal(newAuth.status,200,"Rotated token must authenticate");
+
+    const created = await runAdmin("create-owner",[
+      ["Lost Mode username:", "new-owner"],
+      ["Password:", "BrandNewPassword123!"],
+      ["Confirm password:", "BrandNewPassword123!"]
+    ]);
+    assert.equal(created.code,0,"PostgreSQL owner creation failed: " + created.err);
+    const newOwnerLogin = await api("POST","/api/auth/login",{
+      username:"new-owner",password:"BrandNewPassword123!"
+    });
+    assert.equal(newOwnerLogin.status,200);
+
+    const changed = await runAdmin("change-owner-password",[
+      ["Lost Mode username:", "new-owner"],
+      ["New password:", "ReplacedPassword123!"],
+      ["Confirm new password:", "ReplacedPassword123!"]
+    ]);
+    assert.equal(changed.code,0,"PostgreSQL password change failed: " + changed.err);
+    assert.equal((await api("POST","/api/auth/login",{
+      username:"new-owner",password:"BrandNewPassword123!"
+    })).status,401);
+    assert.equal((await api("POST","/api/auth/login",{
+      username:"new-owner",password:"ReplacedPassword123!"
+    })).status,200);
   } finally {
     try { sqlite.close(); } catch {}
   }
