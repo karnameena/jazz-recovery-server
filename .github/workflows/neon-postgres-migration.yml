@@ -44,6 +44,11 @@ jobs:
           node --check src/pg/server.mjs
           node --check src/pg/sessions.mjs
           node --check src/scripts/import-sqlite-to-postgres.mjs
+          node --check src/scripts/dispatch.mjs
+          node --check src/scripts/pg-create-owner.mjs
+          node --check src/scripts/pg-create-device.mjs
+          node --check src/scripts/pg-change-owner-password.mjs
+          node --check src/scripts/pg-rotate-device.mjs
       - name: Existing SQLite command and owner authorization regression test
         run: node --test tests/location-services-readback.test.mjs
       - name: PostgreSQL real-server and SQLite import integration test
