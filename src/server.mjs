@@ -21,8 +21,11 @@ const DEVICE_AUTH_CACHE_TTL_MS = 5 * 60_000;
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const LOGIN_USER_LIMIT = 8;
 const LOGIN_IP_LIMIT = 30;
-const ALLOWED_COMMANDS = new Set(["DEVICE_STATUS", "GET_LOCATION", "RING_DEVICE", "RECOVERY_PHOTO", "SET_RECOVERY_MODE", "PLAY_VOICE_MESSAGE"]);
-const DEDUPE_COMMANDS = new Set(["device_status", "device_location", "recovery_photo"]);
+const ALLOWED_COMMANDS = new Set(["DEVICE_STATUS", "GET_LOCATION", "RING_DEVICE", "RECOVERY_PHOTO", "SET_RECOVERY_MODE", "PLAY_VOICE_MESSAGE", "LOCATION_STATUS", "LOCATION_ENABLE", "LOCATION_DISABLE"]);
+const LOCATION_COMMANDS = new Set(["location_status", "location_enable", "location_disable"]);
+const LOCATION_WRITE_COMMANDS = new Set(["location_enable", "location_disable"]);
+const LOCATION_COMMAND_TTL_MS = 120_000;
+const DEDUPE_COMMANDS = new Set(["device_status", "device_location", "recovery_photo", "location_status", "location_enable", "location_disable"]);
 const loginAttempts = new Map();
 const invalidDeviceAttempts = new Map();
 const deviceAuthCache = new Map();
@@ -204,6 +207,10 @@ function stateFor(deviceDbId) {
   return { ...row, online: Boolean(lastSeenMs && Date.now() - lastSeenMs <= ONLINE_WINDOW_MS) };
 }
 
+function locationServicesState(value) {
+  return value === "ON" || value === "OFF" ? value : "UNKNOWN";
+}
+
 function publicDevice(row) {
   const state = stateFor(row.id) || {};
   return {
@@ -217,6 +224,8 @@ function publicDevice(row) {
     charging: Boolean(state.charging),
     network: state.network || "UNKNOWN",
     lastSeen: sqliteUtcToIso(state.last_seen),
+    locationServices: state.online ? locationServicesState(state.location_services_status) : "OFFLINE",
+    locationServicesLastConfirmed: state.location_services_timestamp || null,
     location: state.latitude == null ? null : {
       latitude: state.latitude,
       longitude: state.longitude,
@@ -290,6 +299,9 @@ function validateVoiceArgs(args = {}) {
 function mapCommand(type, args = {}) {
   switch (type) {
     case "DEVICE_STATUS": return { type: "device_status", args: {} };
+    case "LOCATION_STATUS": return { type: "location_status", args: {} };
+    case "LOCATION_ENABLE": return { type: "location_enable", args: {} };
+    case "LOCATION_DISABLE": return { type: "location_disable", args: {} };
     case "GET_LOCATION": return { type: "device_location", args: {} };
     case "RING_DEVICE": return { type: "ring_device", args: { durationMs: Math.min(60_000, Math.max(5_000, Number(args.durationMs || 30_000))) } };
     case "RECOVERY_PHOTO": return { type: "recovery_photo", args: { camera: args.camera === "rear" ? "rear" : "front" } };
@@ -309,6 +321,20 @@ function sameCommandArgs(type, leftJson, rightArgs) {
     return String(left.camera || "front") === String(rightArgs.camera || "front");
   } catch {
     return false;
+  }
+}
+
+// Only Location Services commands expire; all existing recovery TTL behavior
+// stays untouched. A command must never execute after a lost phone reconnects late.
+function expireLocationCommands(deviceDbId) {
+  const deadline = sqliteUtcTimestamp(Date.now() - LOCATION_COMMAND_TTL_MS);
+  const expired = db.prepare(`SELECT id,type FROM recovery_commands WHERE device_id=? AND status='pending' AND type IN ('location_enable','location_disable','location_status') AND created_at<?`).all(deviceDbId, deadline);
+  if (!expired.length) return;
+  const update = db.prepare("UPDATE recovery_commands SET status='expired',completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'");
+  const row = db.prepare("SELECT user_id FROM devices WHERE id=?").get(deviceDbId);
+  for (const command of expired) {
+    update.run(command.id);
+    audit(row?.user_id ?? null, deviceDbId, command.type.toUpperCase(), "EXPIRED");
   }
 }
 
@@ -336,9 +362,12 @@ function updateStateFromHeartbeat(device, input) {
   const status = input.status && typeof input.status === "object" ? input.status : {};
   const loc = input.lastKnownLocation?.ok ? input.lastKnownLocation : null;
   db.prepare(`UPDATE device_state SET mode=?,battery=?,charging=?,network=?,online=1,last_seen=CURRENT_TIMESTAMP,
-    latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude),accuracy_meters=COALESCE(?,accuracy_meters),location_timestamp=COALESCE(?,location_timestamp),updated_at=CURRENT_TIMESTAMP WHERE device_id=?`)
+    latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude),accuracy_meters=COALESCE(?,accuracy_meters),location_timestamp=COALESCE(?,location_timestamp),location_services_status=?,location_services_timestamp=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?`)
     .run(input.mode || "NORMAL_MODE", status.battery ?? null, status.charging ? 1 : 0, status.network || "UNKNOWN",
-      loc?.latitude ?? null, loc?.longitude ?? null, loc?.accuracyMeters ?? null, loc?.timestamp ?? null, device.id);
+      loc?.latitude ?? null, loc?.longitude ?? null, loc?.accuracyMeters ?? null, loc?.timestamp ?? null,
+      locationServicesState(status.locationServices),
+      locationServicesState(status.locationServices) === "UNKNOWN" ? null : (Number(status.locationServicesTimestamp) || Date.now()),
+      device.id);
 }
 
 function updateStateFromResult(device, command, result) {
@@ -347,13 +376,22 @@ function updateStateFromResult(device, command, result) {
     const status = result.status || {};
     const loc = result.lastKnownLocation?.ok ? result.lastKnownLocation : null;
     db.prepare(`UPDATE device_state SET mode=?,battery=?,charging=?,network=?,last_seen=CURRENT_TIMESTAMP,
-      latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude),accuracy_meters=COALESCE(?,accuracy_meters),location_timestamp=COALESCE(?,location_timestamp),updated_at=CURRENT_TIMESTAMP WHERE device_id=?`)
+      latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude),accuracy_meters=COALESCE(?,accuracy_meters),location_timestamp=COALESCE(?,location_timestamp),location_services_status=?,location_services_timestamp=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?`)
       .run(result.mode || "NORMAL_MODE", status.battery ?? null, status.charging ? 1 : 0, status.network || "UNKNOWN",
-        loc?.latitude ?? null, loc?.longitude ?? null, loc?.accuracyMeters ?? null, loc?.timestamp ?? null, device.id);
+        loc?.latitude ?? null, loc?.longitude ?? null, loc?.accuracyMeters ?? null, loc?.timestamp ?? null,
+      locationServicesState(status.locationServices),
+      locationServicesState(status.locationServices) === "UNKNOWN" ? null : (Number(status.locationServicesTimestamp) || Date.now()),
+      device.id);
   }
   if (command.type === "device_location" && result.ok) {
     db.prepare(`UPDATE device_state SET latitude=?,longitude=?,accuracy_meters=?,location_timestamp=?,battery=COALESCE(?,battery),network=COALESCE(?,network),last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE device_id=?`)
       .run(result.latitude, result.longitude, result.accuracyMeters ?? null, result.timestamp ?? Date.now(), result.statusSnapshot?.battery ?? null, result.statusSnapshot?.network ?? null, device.id);
+  }
+  if (LOCATION_COMMANDS.has(command.type) && result.ok === true &&
+      (command.type === "location_status" ? ["ON","OFF"].includes(result.locationServices) :
+        result.confirmed === true && result.locationServices === (command.type === "location_enable" ? "ON" : "OFF"))) {
+    db.prepare("UPDATE device_state SET location_services_status=?,location_services_timestamp=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
+      .run(result.locationServices, Number(result.timestamp) || Date.now(), device.id);
   }
   if (command.type === "set_recovery_mode" && result.mode) {
     db.prepare("UPDATE device_state SET mode=?,last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE device_id=?").run(result.mode, device.id);
@@ -474,6 +512,17 @@ const server = http.createServer(async (req, res) => {
       const mapped = mapCommand(action, body.args || {});
       if (!mapped) return json(req, res, 400, { ok: false, error: action === "PLAY_VOICE_MESSAGE" ? "Invalid or oversized recovery voice message" : "Invalid recovery action arguments" });
 
+      if (LOCATION_COMMANDS.has(mapped.type)) {
+        expireLocationCommands(row.id);
+        if (LOCATION_WRITE_COMMANDS.has(mapped.type)) {
+          const conflict = db.prepare(`SELECT id,type FROM recovery_commands WHERE device_id=? AND status='pending' AND type IN ('location_enable','location_disable') AND type<>? LIMIT 1`)
+            .get(row.id, mapped.type);
+          if (conflict) {
+            audit(session.user_id, row.id, action, "CONFLICT");
+            return json(req, res, 409, { ok: false, error: "An opposite Location Services command is already pending. Refresh its result before changing direction." });
+          }
+        }
+      }
       const existing = existingPendingCommand(row.id, mapped);
       if (existing) {
         audit(session.user_id, row.id, action, "COALESCED");
@@ -490,6 +539,32 @@ const server = http.createServer(async (req, res) => {
         .run(id, row.id, mapped.type, JSON.stringify(mapped.args));
       audit(session.user_id, row.id, action, "QUEUED");
       return json(req, res, 202, { ok: true, commandId: id, status: "QUEUED", deduplicated: false });
+    }
+
+    // Result is read only by the authenticated owner of the enrolled device.
+    // Browser never treats HTTP 202 queue acceptance as a successful toggle.
+    const locationResultMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
+    if (req.method === "GET" && locationResultMatch) {
+      const session = requireSession(req, res); if (!session) return;
+      const row = ownerDevice(session.user_id, locationResultMatch[1]);
+      if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
+      expireLocationCommands(row.id);
+      const command = db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(locationResultMatch[2], row.id);
+      if (!command || !LOCATION_COMMANDS.has(command.type)) return json(req, res, 404, { ok: false, error: "Command not found" });
+      const outcome = command.result_json ? JSON.parse(command.result_json) : null;
+      const desired = command.type === "location_enable" ? "ON" : command.type === "location_disable" ? "OFF" : null;
+      const confirmed = command.status === "done" && outcome?.ok === true &&
+        (desired ? outcome.confirmed === true && outcome.locationServices === desired :
+          ["ON","OFF"].includes(outcome.locationServices));
+      const state = stateFor(row.id);
+      const status = confirmed ? "CONFIRMED" :
+        command.status === "expired" ? "EXPIRED" :
+        command.status === "done" ? "FAILED" :
+        state?.online ? "PENDING" : "DEVICE_OFFLINE";
+      return json(req, res, 200, { ok: true, commandId: command.id, status,
+        confirmed, command: command.type, result: outcome,
+        createdAt: sqliteUtcToIso(command.created_at),
+        completedAt: sqliteUtcToIso(command.completed_at) });
     }
 
     const auditMatch = path.match(/^\/api\/devices\/(\d+)\/audit$/);
@@ -514,11 +589,19 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && path === "/android/device/commands/next") {
       const device = authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
+      expireLocationCommands(device.id);
       const command = db.prepare(`SELECT * FROM recovery_commands WHERE device_id=? AND status='pending' AND (leased_until IS NULL OR leased_until<CURRENT_TIMESTAMP) ORDER BY created_at LIMIT 1`).get(device.id);
       if (!command) return json(req, res, 200, { ok: true, command: null });
       const leasedUntil = sqliteUtcTimestamp(Date.now() + 30_000);
       db.prepare("UPDATE recovery_commands SET leased_until=? WHERE id=?").run(leasedUntil, command.id);
-      return json(req, res, 200, { ok: true, command: { id: command.id, type: command.type, args: JSON.parse(command.args_json || "{}"), createdAt: sqliteUtcToIso(command.created_at) } });
+      const createdAtMs = sqliteUtcToMs(command.created_at);
+      return json(req, res, 200, { ok: true, command: {
+        id: command.id, type: command.type, args: JSON.parse(command.args_json || "{}"),
+        createdAt: sqliteUtcToIso(command.created_at),
+        ...(LOCATION_COMMANDS.has(command.type)
+          ? { createdAtMs, expiresAtMs: createdAtMs + LOCATION_COMMAND_TTL_MS }
+          : {})
+      } });
     }
 
     const resultMatch = path.match(/^\/android\/device\/commands\/([a-f0-9-]+)\/result$/i);
@@ -527,6 +610,12 @@ const server = http.createServer(async (req, res) => {
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
       const command = db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
       if (!command) return json(req, res, 404, { ok: false, error: "Unknown recovery command" });
+      if (LOCATION_COMMANDS.has(command.type)) {
+        expireLocationCommands(device.id);
+        const refreshed = db.prepare("SELECT status FROM recovery_commands WHERE id=?").get(command.id);
+        if (refreshed?.status === "expired") return json(req, res, 409, { ok: false, error: "Location Services command expired" });
+        if (refreshed?.status === "done") return json(req, res, 200, { ok: true, deduplicated: true });
+      }
       const body = await readJson(req, 8 * 1024 * 1024);
       const result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
       db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=?")
