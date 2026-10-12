@@ -12,9 +12,16 @@ const { Pool, types } = pg;
 // timestamps, which fit within JavaScript's safe integer range.
 types.setTypeParser(20, value => Number(value));
 
+// PostgreSQL integration tests may use plaintext ONLY on loopback in
+// non-production. Neon and every remote database must use verified TLS.
+const dbHostname = new URL(url).hostname.toLowerCase();
+const loopback = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(dbHostname);
+const insecureTest = process.env.JAZZ_PG_ALLOW_INSECURE_LOCALHOST === "true" &&
+  process.env.NODE_ENV !== "production" && loopback;
+
 export const pool = new Pool({
   connectionString: url,
-  ssl: { rejectUnauthorized: true },
+  ssl: insecureTest ? false : { rejectUnauthorized: true },
   max: 5,
   connectionTimeoutMillis: 10_000,
   idleTimeoutMillis: 30_000
