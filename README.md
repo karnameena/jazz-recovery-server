@@ -47,7 +47,7 @@ Render provides `PORT`; don't hardcode it in the hosted backend. Do not set `NOD
 **Deploying source code does not migrate accounts.** The backend automatically applies SQL migrations on startup, but a new empty disk contains no user or paired device. Login will return `Invalid username or password` even when your credentials match the owner entry in your *local* database.
 
 Local source known to contain one owner and one paired Android device:
-`C:\Users\gunak\Downloads\Jazz-AI-Coding-UI\services\lost-mode-server\data\lost-mode.db`
+`<your-original-project>/services/lost-mode-server/data/lost-mode.db`
 
 Do not add this file to the repository. Do not invent a new device credential or reset the phone pairing. For hosted continuity, securely transfer a **consistent SQLite backup** (Node `VACUUM INTO`, with the source database active) from your trusted PC to the Render persistent disk using a private administrator-managed channel, verifying the file and `PRAGMA quick_check` before starting the hosted backend. This step depends on how you administer the Render disk and should be done only after GitHub exposure is remediated and replacement credentials are planned.
 
