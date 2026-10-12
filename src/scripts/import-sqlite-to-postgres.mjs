@@ -2,7 +2,6 @@
 // Dry-run unless BOTH --apply and JAZZ_CONFIRM_MIGRATION=YES are supplied.
 import fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { applyMigrations, closeDatabase, db } from "../pg/database.mjs";
 
 const sourceFile = String(process.env.JAZZ_SQLITE_SOURCE || "").trim();
 if (!sourceFile || !fs.existsSync(sourceFile)) {
@@ -57,6 +56,8 @@ async function run() {
     return;
   }
 
+  const { applyMigrations, closeDatabase, db } = await import("../pg/database.mjs");
+  try {
   await applyMigrations();
   await db.transaction(async () => {
     await db.prepare("SELECT pg_advisory_xact_lock(7482362)").get();
@@ -109,9 +110,10 @@ async function run() {
       if (restored?.credential_hash !== row.credential_hash) throw new Error("Device credential hash mismatch");
     }
   });
+  } finally { await closeDatabase(); }
   console.log("Import committed and validated; existing owner/device IDs and hashes preserved.");
   console.log("Existing sessions were not imported; log in again. Pending commands were safely expired.");
 }
 
 try { await run(); }
-finally { source.close(); await closeDatabase(); }
+finally { source.close(); }
