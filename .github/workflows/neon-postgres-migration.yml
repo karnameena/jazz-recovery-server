@@ -1,0 +1,55 @@
+name: Jazz PostgreSQL Migration Verification
+on:
+  push:
+    branches: [feature/neon-postgres-migration-20261012]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  postgres-migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: jazz-ci-password
+          POSTGRES_USER: jazz_ci
+          POSTGRES_DB: jazz_migration_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jazz_ci -d jazz_migration_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      JAZZ_TEST_DATABASE_URL: postgresql://jazz_ci:jazz-ci-password@127.0.0.1:5432/jazz_migration_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Ensure Git never tracks private recovery files
+        run: |
+          if git ls-files -- 'data/*' '*.db' '*.db-shm' '*.db-wal' '*.sqlite' '.env' '.env.local' | grep -q .; then
+            echo "Private SQLite or environment data must not be committed."
+            exit 1
+          fi
+      - name: Install open-source dependencies
+        run: npm install --no-audit --no-fund
+      - name: Check entrypoint, adapter, server, migration syntax
+        run: |
+          node --check src/entrypoint.mjs
+          node --check src/pg/database.mjs
+          node --check src/pg/server.mjs
+          node --check src/pg/sessions.mjs
+          node --check src/scripts/import-sqlite-to-postgres.mjs
+          node --check src/scripts/dispatch.mjs
+          node --check src/scripts/pg-create-owner.mjs
+          node --check src/scripts/pg-create-device.mjs
+          node --check src/scripts/pg-change-owner-password.mjs
+          node --check src/scripts/pg-rotate-device.mjs
+      - name: Existing SQLite command and owner authorization regression test
+        run: node --test tests/location-services-readback.test.mjs
+      - name: PostgreSQL real-server and SQLite import integration test
+        run: node --test tests/postgres-migration.test.mjs

@@ -1,25 +1,23 @@
-# Jazz Lost Mode backend ONLY (no website and no database files).
-# IMPORTANT: This Blueprint uses a PAID Starter Web Service with a persistent
-# disk. Review Render charges before creating the service.
+# STAGING ONLY — this branch is NOT deployed automatically.
+# Render Free web services are ephemeral. All persistent state is stored in
+# privately configured Neon PostgreSQL, never in the Render filesystem.
 services:
   - type: web
     name: jazz-recovery-server
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /health
-    disk:
-      name: lostmode-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_VERSION
-        value: "24.21.0"
+        value: "24"
       - key: NODE_ENV
         value: production
-      - key: LOST_MODE_DB_PATH
-        value: /var/data/lost-mode.db
+      - key: JAZZ_DB_ENGINE
+        value: postgres
+      - key: DATABASE_URL
+        sync: false
       - key: LOST_MODE_PUBLIC_ORIGINS
         sync: false
       - key: LOST_MODE_COOKIE_SECURE
