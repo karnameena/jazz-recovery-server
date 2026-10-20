@@ -1,7 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { applyMigrations, db } from "./database.mjs";
-import { hashSecret, verifySecret } from "../auth/password.mjs";
+import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
 
 await applyMigrations();
@@ -218,6 +218,7 @@ async function publicDevice(row) {
     id: row.id,
     deviceId: row.device_id,
     deviceName: row.device_name,
+    imei: row.imei || null,
     deviceType: row.device_type,
     online: Boolean(state.online),
     mode: state.mode || "NORMAL_MODE",
@@ -446,6 +447,57 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && path === "/health") {
       return json(req, res, 200, { ok: true, service: "jazz-lost-mode-server" });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/register") {
+      const body = await readJson(req, 32 * 1024);
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      const deviceName = String(body.deviceName || "").trim();
+      const imei = String(body.imei || "").replace(/[\s-]/g, "");
+      const deviceId = String(body.deviceId || "").trim();
+      const deviceToken = String(body.deviceToken || "").trim();
+
+      if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) {
+        return json(req, res, 400, { ok: false, error: "Username must be 3–64 letters, numbers, dots, underscores or hyphens." });
+      }
+      const passwordError = validatePassword(password);
+      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      if (!deviceName || deviceName.length > 80) return json(req, res, 400, { ok: false, error: "Enter a device name (up to 80 characters)." });
+      if (!/^\d{14,16}$/.test(imei)) return json(req, res, 400, { ok: false, error: "Enter a valid 14–16 digit IMEI." });
+      if (!/^[A-Za-z0-9._:-]{3,120}$/.test(deviceId)) return json(req, res, 400, { ok: false, error: "Invalid device token ID." });
+      if (deviceToken.length < 32 || deviceToken.length > 512 || !/^[A-Za-z0-9_-]+$/.test(deviceToken)) {
+        return json(req, res, 400, { ok: false, error: "Generate a valid device token in the Jazz Recovery app." });
+      }
+
+      try {
+        const registered = await db.transaction(async () => {
+          if (await db.prepare("SELECT id FROM users WHERE LOWER(username)=LOWER(?)").get(username)) {
+            return { conflict: "Username is already registered." };
+          }
+          if (await db.prepare("SELECT id FROM devices WHERE device_id=?").get(deviceId)) {
+            return { conflict: "This device token ID is already registered." };
+          }
+          const user = await db.prepare("INSERT INTO users(username,password_hash) VALUES(?,?) RETURNING id")
+            .get(username, hashSecret(password));
+          const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
+            .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
+          await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
+          await audit(user.id, device.id, "DEVICE_REGISTER", "SUCCESS");
+          return { userId: user.id, deviceId: device.id };
+        });
+        if (registered.conflict) return json(req, res, 409, { ok: false, error: registered.conflict });
+        const session = await createSession(registered.userId);
+        return json(req, res, 201, {
+          ok: true,
+          username,
+          device: { id: registered.deviceId, deviceId, deviceName, imei, deviceType: "Android" },
+          expiresAt: session.expires
+        }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
+      } catch (error) {
+        if (error?.code === "23505") return json(req, res, 409, { ok: false, error: "Username or device is already registered." });
+        throw error;
+      }
     }
 
     if (req.method === "POST" && path === "/api/auth/login") {
