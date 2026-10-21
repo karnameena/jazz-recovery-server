@@ -12,5 +12,8 @@
   },
   "engines": {
     "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "^13.2.2"
   }
 }
