@@ -1,5 +1,3 @@
-ALTER TABLE users ADD COLUMN recovery_pin_hash TEXT;
-ALTER TABLE devices ADD COLUMN imei TEXT;
 
 CREATE TABLE IF NOT EXISTS passkey_credentials (
   credential_id TEXT PRIMARY KEY,
