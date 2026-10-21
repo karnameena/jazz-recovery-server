@@ -1,0 +1,24 @@
+name: Server validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feature/passkey-password-reset-device-repair-20261021]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install
+      - run: node --check src/server.mjs
+      - run: node --check src/auth/password.mjs
+      - run: node --check src/db/database.mjs
+      - name: Apply migrations to an isolated CI database
+        env:
+          LOST_MODE_DB_PATH: ./data/ci-validation.db
+        run: npm run migrate

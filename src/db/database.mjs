@@ -32,6 +32,17 @@ export function applyMigrations() {
       throw error;
     }
   }
+
+  // Older deployed databases may already contain these columns. Add them only
+  // when absent so account-recovery upgrades remain safe across schema variants.
+  const ensureColumn = (table, column, definition) => {
+    const columns = db.prepare("PRAGMA table_info(" + table + ")").all();
+    if (!columns.some(item => item.name === column)) {
+      db.exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+    }
+  };
+  ensureColumn("users", "recovery_pin_hash", "TEXT");
+  ensureColumn("devices", "imei", "TEXT");
 }
 
 export function cleanupExpiredSessions() {
