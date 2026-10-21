@@ -1,7 +1,8 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { applyMigrations, db } from "./db/database.mjs";
-import { hashSecret, verifySecret } from "./auth/password.mjs";
+import { hashSecret, verifySecret, validatePassword } from "./auth/password.mjs";
+import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./auth/sessions.mjs";
 
 applyMigrations();
@@ -445,6 +446,211 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && path === "/health") {
       return json(req, res, 200, { ok: true, service: "jazz-lost-mode-server" });
+    }
+
+
+    if (req.method === "POST" && path === "/api/auth/register") {
+      const body = await readJson(req, 32 * 1024);
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      const deviceName = String(body.deviceName || "").trim();
+      const imei = String(body.imei || "").trim();
+      const deviceId = String(body.deviceId || "").trim();
+      const deviceToken = String(body.deviceToken || "").trim();
+      const recoveryPin = String(body.recoveryPin || "");
+      const confirmRecoveryPin = String(body.confirmRecoveryPin || recoveryPin);
+      const passwordError = validatePassword(password);
+      if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) return json(req, res, 400, { ok: false, error: "Username must be 3–64 characters using letters, numbers, dots, underscores or hyphens." });
+      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      if (!deviceName || deviceName.length > 80 || !/^\d{14,20}$/.test(imei) ||
+          !deviceId || deviceId.length > 128 || !/^[A-Za-z0-9._:-]{8,128}$/.test(deviceId) ||
+          deviceToken.length < 32 || deviceToken.length > 512) {
+        return json(req, res, 400, { ok: false, error: "Enter a valid device name, IMEI, device ID and device token from Jazz Recovery." });
+      }
+      if (!/^\d{4}$/.test(recoveryPin) || recoveryPin !== confirmRecoveryPin) {
+        return json(req, res, 400, { ok: false, error: "Enter and confirm the same 4-digit recovery PIN." });
+      }
+      if (db.prepare("SELECT 1 FROM users WHERE username=? COLLATE NOCASE").get(username)) {
+        return json(req, res, 409, { ok: false, error: "This username is already registered. Sign in with your existing account instead." });
+      }
+      if (db.prepare("SELECT 1 FROM devices WHERE device_id=?").get(deviceId)) {
+        return json(req, res, 409, { ok: false, error: "This device ID is already enrolled. Use secure device repair instead of registering it again." });
+      }
+      let userId;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const userResult = db.prepare("INSERT INTO users(username,password_hash,recovery_pin_hash) VALUES(?,?,?)")
+          .run(username, hashSecret(password), hashSecret(recoveryPin));
+        userId = Number(userResult.lastInsertRowid);
+        const deviceResult = db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?)")
+          .run(userId, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
+        db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(Number(deviceResult.lastInsertRowid));
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      const session = createSession(userId);
+      audit(userId, Number(db.prepare("SELECT id FROM devices WHERE device_id=?").get(deviceId).id), "REGISTER", "SUCCESS");
+      return json(req, res, 201, { ok: true, username, expiresAt: session.expires }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/forgot-password") {
+      const body = await readJson(req, 32 * 1024);
+      const username = String(body.username || "").trim();
+      const recoveryPin = String(body.recoveryPin || "");
+      const newPassword = String(body.newPassword || "");
+      const passwordError = validatePassword(newPassword);
+      if (!username || username.length > 64 || !/^\d{4}$/.test(recoveryPin) || passwordError) {
+        return json(req, res, 400, { ok: false, error: passwordError || "Invalid username or recovery PIN." });
+      }
+      const user = db.prepare("SELECT * FROM users WHERE username=? COLLATE NOCASE").get(username);
+      if (!user || !user.recovery_pin_hash || !verifySecret(recoveryPin, user.recovery_pin_hash)) {
+        audit(user?.id ?? null, null, "PASSWORD_RESET_PIN", "FAILED");
+        return json(req, res, 401, { ok: false, error: "Unable to verify the username and recovery PIN." });
+      }
+      db.prepare("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(hashSecret(newPassword), user.id);
+      db.prepare("DELETE FROM sessions WHERE user_id=?").run(user.id);
+      audit(user.id, null, "PASSWORD_RESET_PIN", "SUCCESS");
+      return json(req, res, 200, { ok: true });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/device-repair") {
+      const body = await readJson(req, 32 * 1024);
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      const deviceId = String(body.deviceId || "").trim();
+      const deviceToken = String(body.deviceToken || "").trim();
+      const deviceName = String(body.deviceName || "").trim();
+      const imei = String(body.imei || "").trim();
+      const ip = ipOf(req);
+      if (!username || username.length > 64 || !password || password.length > 512 || !deviceId || deviceId.length > 128 || deviceToken.length < 32 || deviceToken.length > 512) {
+        return json(req, res, 400, { ok: false, error: "Username, password, existing device ID and a new device token are required." });
+      }
+      if (loginRateLimited(ip, username)) return json(req, res, 429, { ok: false, error: "Too many attempts. Try again later." }, { "Retry-After": "900" });
+      const user = db.prepare("SELECT * FROM users WHERE username=? COLLATE NOCASE").get(username);
+      const validPassword = verifySecret(password, user?.password_hash || dummyPasswordHash);
+      if (!user || !validPassword) {
+        recordLoginFailure(ip, username);
+        audit(user?.id ?? null, null, "DEVICE_REPAIR", "FAILED_AUTH");
+        return json(req, res, 401, { ok: false, error: "Invalid username or password." });
+      }
+      const device = db.prepare("SELECT * FROM devices WHERE user_id=? AND device_id=?").get(user.id, deviceId);
+      if (!device) {
+        audit(user.id, null, "DEVICE_REPAIR", "DEVICE_NOT_OWNED");
+        return json(req, res, 404, { ok: false, error: "That existing device ID is not registered to this account. Check the ID in your website device list." });
+      }
+      db.prepare("UPDATE devices SET credential_hash=?,device_name=COALESCE(NULLIF(?,''),device_name),imei=COALESCE(NULLIF(?,''),imei),updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?")
+        .run(hashSecret(deviceToken), deviceName.slice(0, 80), /^\d{14,20}$/.test(imei) ? imei : "", device.id, user.id);
+      for (const key of deviceAuthCache.keys()) if (key.startsWith(String(device.id) + ":")) deviceAuthCache.delete(key);
+      clearLoginFailures(ip, username);
+      audit(user.id, device.id, "DEVICE_REPAIR", "SUCCESS");
+      return json(req, res, 200, { ok: true, deviceId, message: "Existing device record re-paired. Its history and recovery state were preserved." });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/passkey/register/options") {
+      const session = requireSession(req, res); if (!session) return;
+      const user = db.prepare("SELECT id,username FROM users WHERE id=?").get(session.user_id);
+      if (!user) return json(req, res, 401, { ok: false, error: "Authentication required" });
+      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
+      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
+      const existing = db.prepare("SELECT credential_id,transports_json FROM passkey_credentials WHERE user_id=?").all(user.id);
+      const options = await generateRegistrationOptions({
+        rpName: "Jazz Recovery", rpID,
+        userID: new Uint8Array(Buffer.from(String(user.id), "utf8")),
+        userName: user.username, userDisplayName: user.username, attestationType: "none",
+        excludeCredentials: existing.map(item => ({ id: item.credential_id, transports: JSON.parse(item.transports_json || "[]") })),
+        authenticatorSelection: { residentKey: "preferred", userVerification: "required" }, timeout: 60000
+      });
+      const flowId = crypto.randomUUID();
+      db.prepare("INSERT INTO passkey_challenges(id,user_id,challenge,kind,expires_at) VALUES(?,?,?,?,?)")
+        .run(flowId, user.id, options.challenge, "register", new Date(Date.now() + 5 * 60_000).toISOString());
+      return json(req, res, 200, { ok: true, flowId, options });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/passkey/register/verify") {
+      const session = requireSession(req, res); if (!session) return;
+      const body = await readJson(req, 128 * 1024);
+      const challengeRow = db.prepare("SELECT * FROM passkey_challenges WHERE id=? AND user_id=? AND kind='register'").get(String(body.flowId || ""), session.user_id);
+      if (!challengeRow || Date.parse(challengeRow.expires_at) <= Date.now()) {
+        if (challengeRow) db.prepare("DELETE FROM passkey_challenges WHERE id=?").run(challengeRow.id);
+        return json(req, res, 400, { ok: false, error: "Passkey setup expired. Please try again." });
+      }
+      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
+      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
+      const verification = await verifyRegistrationResponse({
+        response: body.response, expectedChallenge: challengeRow.challenge,
+        expectedOrigin: rpOrigin, expectedRPID: rpID, requireUserVerification: true
+      });
+      db.prepare("DELETE FROM passkey_challenges WHERE id=?").run(challengeRow.id);
+      if (!verification.verified || !verification.registrationInfo) return json(req, res, 400, { ok: false, error: "Passkey verification failed." });
+      const credential = verification.registrationInfo.credential;
+      db.prepare("INSERT OR REPLACE INTO passkey_credentials(credential_id,user_id,public_key,counter,transports_json) VALUES(?,?,?,?,?)")
+        .run(credential.id, session.user_id, Buffer.from(credential.publicKey).toString("base64url"), Number(credential.counter || 0), JSON.stringify(credential.transports || body.response.response?.transports || []));
+      audit(session.user_id, null, "PASSKEY_REGISTER", "SUCCESS");
+      return json(req, res, 200, { ok: true });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/password-reset/passkey/options") {
+      const body = await readJson(req, 16 * 1024);
+      const username = String(body.username || "").trim();
+      const user = username && username.length <= 64 ? db.prepare("SELECT id,username FROM users WHERE username=? COLLATE NOCASE").get(username) : null;
+      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
+      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
+      const credentials = user ? db.prepare("SELECT credential_id,transports_json FROM passkey_credentials WHERE user_id=?").all(user.id) : [];
+      if (!credentials.length) return json(req, res, 200, { ok: true, available: false, message: "No registered passkey is available for this account. Use your recovery PIN or sign in to register a passkey." });
+      const options = await generateAuthenticationOptions({
+        rpID, allowCredentials: credentials.map(item => ({ id: item.credential_id, transports: JSON.parse(item.transports_json || "[]") })),
+        userVerification: "required", timeout: 60000
+      });
+      const flowId = crypto.randomUUID();
+      db.prepare("INSERT INTO passkey_challenges(id,user_id,challenge,kind,expires_at) VALUES(?,?,?,?,?)")
+        .run(flowId, user.id, options.challenge, "reset", new Date(Date.now() + 5 * 60_000).toISOString());
+      return json(req, res, 200, { ok: true, available: true, flowId, options });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/password-reset/passkey/verify") {
+      const body = await readJson(req, 128 * 1024);
+      const flowId = String(body.flowId || "");
+      const newPassword = String(body.newPassword || "");
+      const passwordError = validatePassword(newPassword);
+      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      const challengeRow = db.prepare("SELECT * FROM passkey_challenges WHERE id=? AND kind='reset'").get(flowId);
+      if (!challengeRow || Date.parse(challengeRow.expires_at) <= Date.now()) {
+        if (challengeRow) db.prepare("DELETE FROM passkey_challenges WHERE id=?").run(challengeRow.id);
+        return json(req, res, 400, { ok: false, error: "Passkey reset expired. Start again." });
+      }
+      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
+      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
+      const credentialId = String(body.response?.id || "");
+      const credential = db.prepare("SELECT * FROM passkey_credentials WHERE credential_id=? AND user_id=?").get(credentialId, challengeRow.user_id);
+      if (!credential) {
+        db.prepare("DELETE FROM passkey_challenges WHERE id=?").run(challengeRow.id);
+        audit(challengeRow.user_id, null, "PASSWORD_RESET_PASSKEY", "FAILED_CREDENTIAL");
+        return json(req, res, 401, { ok: false, error: "Passkey could not be verified." });
+      }
+      const verification = await verifyAuthenticationResponse({
+        response: body.response, expectedChallenge: challengeRow.challenge,
+        expectedOrigin: rpOrigin, expectedRPID: rpID,
+        credential: {
+          id: credential.credential_id,
+          publicKey: new Uint8Array(Buffer.from(credential.public_key, "base64url")),
+          counter: Number(credential.counter || 0),
+          transports: JSON.parse(credential.transports_json || "[]")
+        },
+        requireUserVerification: true
+      });
+      db.prepare("DELETE FROM passkey_challenges WHERE id=?").run(challengeRow.id);
+      if (!verification.verified) {
+        audit(challengeRow.user_id, null, "PASSWORD_RESET_PASSKEY", "FAILED_VERIFICATION");
+        return json(req, res, 401, { ok: false, error: "Passkey could not be verified." });
+      }
+      db.prepare("UPDATE passkey_credentials SET counter=?,last_used_at=CURRENT_TIMESTAMP WHERE credential_id=?")
+        .run(Number(verification.authenticationInfo.newCounter || 0), credential.credential_id);
+      db.prepare("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(hashSecret(newPassword), challengeRow.user_id);
+      db.prepare("DELETE FROM sessions WHERE user_id=?").run(challengeRow.user_id);
+      audit(challengeRow.user_id, null, "PASSWORD_RESET_PASSKEY", "SUCCESS");
+      return json(req, res, 200, { ok: true });
     }
 
     if (req.method === "POST" && path === "/api/auth/login") {
