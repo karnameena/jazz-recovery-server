@@ -248,7 +248,9 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
       deviceName: "Recovery Test Phone",
       imei: "123456789012345",
       deviceId: "jazz-recovery-test",
-      deviceToken: recoveryToken
+      deviceToken: recoveryToken,
+      recoveryPin: "2580",
+      confirmRecoveryPin: "2580"
     });
     assert.equal(registration.status, 201, "Owner registration should create account and pair device");
     assert.equal(registration.data.device.imei, "123456789012345");
@@ -270,6 +272,27 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
       deviceToken: crypto.randomBytes(32).toString("base64url")
     });
     assert.equal(duplicateRegistration.status, 409, "Duplicate owner usernames must be rejected");
+
+    const rejectedReset = await api("POST", "/api/auth/forgot-password", {
+      username: "recovery-owner",
+      recoveryPin: "0000",
+      newPassword: "ResetRecovery123!"
+    });
+    assert.equal(rejectedReset.status, 400, "An incorrect recovery PIN must not reset the password");
+    const passwordReset = await api("POST", "/api/auth/forgot-password", {
+      username: "recovery-owner",
+      recoveryPin: "2580",
+      newPassword: "ResetRecovery123!"
+    });
+    assert.equal(passwordReset.status, 200, "Correct recovery PIN should allow a password reset");
+    assert.equal((await api("POST", "/api/auth/login", {
+      username: "recovery-owner", password: "RecoveryOwner123!"
+    })).status, 401, "Old password must stop working after reset");
+    assert.equal((await api("POST", "/api/auth/login", {
+      username: "recovery-owner", password: "ResetRecovery123!"
+    })).status, 200, "New password should work after reset");
+    assert.equal((await api("GET", "/api/devices", null, registeredCookie)).status, 401,
+      "Password reset must invalidate existing browser sessions");
 
     const changed = await runAdmin("change-owner-password",[
       ["Lost Mode username:", "new-owner"],
