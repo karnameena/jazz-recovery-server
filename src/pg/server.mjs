@@ -27,6 +27,8 @@ const LOCATION_WRITE_COMMANDS = new Set(["location_enable", "location_disable"])
 const LOCATION_COMMAND_TTL_MS = 120_000;
 const DEDUPE_COMMANDS = new Set(["device_status", "device_location", "recovery_photo", "location_status", "location_enable", "location_disable"]);
 const loginAttempts = new Map();
+const recoveryAttempts = new Map();
+const dummyRecoveryPinHash = hashSecret("Jazz-Recovery-Dummy-PIN-Not-A-Valid-Recovery-PIN");
 const invalidDeviceAttempts = new Map();
 const deviceAuthCache = new Map();
 const dummyPasswordHash = hashSecret("Jazz-Lost-Mode-Dummy-Credential-Not-A-Login");
@@ -170,6 +172,24 @@ function clearLoginFailures(ip, username) {
   const normalized = String(username || "").toLowerCase();
   loginAttempts.delete(`user:${normalized}`);
   loginAttempts.delete(`ip:${ip}`);
+}
+
+function recoveryRateLimited(ip, username) {
+  const normalized = String(username || "").toLowerCase();
+  return attemptCount(recoveryAttempts, `user:${normalized}`, LOGIN_WINDOW_MS) >= 5 ||
+    attemptCount(recoveryAttempts, `ip:${ip}`, LOGIN_WINDOW_MS) >= 20;
+}
+
+function recordRecoveryFailure(ip, username) {
+  const normalized = String(username || "").toLowerCase();
+  recordAttempt(recoveryAttempts, `user:${normalized}`, LOGIN_WINDOW_MS);
+  recordAttempt(recoveryAttempts, `ip:${ip}`, LOGIN_WINDOW_MS);
+}
+
+function clearRecoveryFailures(ip, username) {
+  const normalized = String(username || "").toLowerCase();
+  recoveryAttempts.delete(`user:${normalized}`);
+  recoveryAttempts.delete(`ip:${ip}`);
 }
 
 async function audit(userId, deviceId, action, status) {
@@ -457,12 +477,17 @@ const server = http.createServer(async (req, res) => {
       const imei = String(body.imei || "").replace(/[\s-]/g, "");
       const deviceId = String(body.deviceId || "").trim();
       const deviceToken = String(body.deviceToken || "").trim();
+      const recoveryPin = String(body.recoveryPin || "");
+      const confirmRecoveryPin = String(body.confirmRecoveryPin || recoveryPin);
 
       if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) {
         return json(req, res, 400, { ok: false, error: "Username must be 3–64 letters, numbers, dots, underscores or hyphens." });
       }
       const passwordError = validatePassword(password);
       if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      if (!/^\\d{4}$/.test(recoveryPin) || recoveryPin !== confirmRecoveryPin) {
+        return json(req, res, 400, { ok: false, error: "Enter and confirm the same 4-digit recovery PIN." });
+      }
       if (!deviceName || deviceName.length > 80) return json(req, res, 400, { ok: false, error: "Enter a device name (up to 80 characters)." });
       if (!/^\d{14,16}$/.test(imei)) return json(req, res, 400, { ok: false, error: "Enter a valid 14–16 digit IMEI." });
       if (!/^[A-Za-z0-9._:-]{3,120}$/.test(deviceId)) return json(req, res, 400, { ok: false, error: "Invalid device token ID." });
@@ -478,8 +503,8 @@ const server = http.createServer(async (req, res) => {
           if (await db.prepare("SELECT id FROM devices WHERE device_id=?").get(deviceId)) {
             return { conflict: "This device token ID is already registered." };
           }
-          const user = await db.prepare("INSERT INTO users(username,password_hash) VALUES(?,?) RETURNING id")
-            .get(username, hashSecret(password));
+          const user = await db.prepare("INSERT INTO users(username,password_hash,recovery_pin_hash) VALUES(?,?,?) RETURNING id")
+            .get(username, hashSecret(password), hashSecret(recoveryPin));
           const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
@@ -525,6 +550,58 @@ const server = http.createServer(async (req, res) => {
       const session = await createSession(user.id);
       await audit(user.id, null, "LOGIN", "SUCCESS");
       return json(req, res, 200, { ok: true, username: user.username, expiresAt: session.expires }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/recovery-pin") {
+      const session = await requireSession(req, res);
+      if (!session) return;
+      const body = await readJson(req, 16 * 1024);
+      const password = String(body.password || "");
+      const recoveryPin = String(body.recoveryPin || "");
+      const confirmRecoveryPin = String(body.confirmRecoveryPin || "");
+      if (!/^\d{4}$/.test(recoveryPin) || recoveryPin !== confirmRecoveryPin) {
+        return json(req, res, 400, { ok: false, error: "Enter and confirm the same 4-digit recovery PIN." });
+      }
+      const user = await db.prepare("SELECT * FROM users WHERE id=?").get(session.user_id);
+      if (!user || !verifySecret(password, user.password_hash)) {
+        return json(req, res, 401, { ok: false, error: "Current password is incorrect." });
+      }
+      await db.transaction(async () => {
+        await db.prepare("UPDATE users SET recovery_pin_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+          .run(hashSecret(recoveryPin), session.user_id);
+        await audit(session.user_id, null, "RECOVERY_PIN_SET", "SUCCESS");
+      });
+      return json(req, res, 200, { ok: true, message: "Recovery PIN saved securely." });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/forgot-password") {
+      const body = await readJson(req, 16 * 1024);
+      const username = String(body.username || "").trim();
+      const recoveryPin = String(body.recoveryPin || "");
+      const newPassword = String(body.newPassword || "");
+      const ip = ipOf(req);
+      if (!username || username.length > 64 || !/^\d{4}$/.test(recoveryPin)) {
+        return json(req, res, 400, { ok: false, error: "Unable to verify recovery details. Check the username and 4-digit PIN." });
+      }
+      if (recoveryRateLimited(ip, username)) {
+        return json(req, res, 429, { ok: false, error: "Too many recovery attempts. Try again later." }, { "Retry-After": "900" });
+      }
+      const passwordError = validatePassword(newPassword);
+      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      const user = await db.prepare("SELECT id,username,recovery_pin_hash FROM users WHERE username=? COLLATE NOCASE").get(username);
+      const validPin = verifySecret(recoveryPin, user?.recovery_pin_hash || dummyRecoveryPinHash);
+      if (!user || !user.recovery_pin_hash || !validPin) {
+        recordRecoveryFailure(ip, username);
+        await audit(user?.id ?? null, null, "PASSWORD_RESET", "FAILED");
+        return json(req, res, 400, { ok: false, error: "Unable to verify recovery details. Check the username and 4-digit PIN, or use another recovery method." });
+      }
+      await db.transaction(async () => {
+        await db.prepare("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(hashSecret(newPassword), user.id);
+        await db.prepare("DELETE FROM sessions WHERE user_id=?").run(user.id);
+        await audit(user.id, null, "PASSWORD_RESET", "SUCCESS");
+      });
+      clearRecoveryFailures(ip, username);
+      return json(req, res, 200, { ok: true, message: "Password reset successful. Sign in with your new password." }, { "Set-Cookie": clearSessionCookies() });
     }
 
     if (req.method === "POST" && path === "/api/auth/logout") {
