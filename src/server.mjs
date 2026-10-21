@@ -453,6 +453,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req, 32 * 1024);
       const username = String(body.username || "").trim();
       const password = String(body.password || "");
+      const confirmPassword = String(body.confirmPassword || password);
       const deviceName = String(body.deviceName || "").trim();
       const imei = String(body.imei || "").trim();
       const deviceId = String(body.deviceId || "").trim();
@@ -462,6 +463,7 @@ const server = http.createServer(async (req, res) => {
       const passwordError = validatePassword(password);
       if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) return json(req, res, 400, { ok: false, error: "Username must be 3–64 characters using letters, numbers, dots, underscores or hyphens." });
       if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      if (password !== confirmPassword) return json(req, res, 400, { ok: false, error: "Passwords do not match." });
       if (!deviceName || deviceName.length > 80 || !/^\d{14,20}$/.test(imei) ||
           !deviceId || deviceId.length > 128 || !/^[A-Za-z0-9._:-]{8,128}$/.test(deviceId) ||
           deviceToken.length < 32 || deviceToken.length > 512) {
