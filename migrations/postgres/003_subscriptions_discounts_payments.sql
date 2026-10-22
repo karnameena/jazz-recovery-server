@@ -61,3 +61,9 @@ CREATE TABLE IF NOT EXISTS payment_webhook_events (
   event_type TEXT NOT NULL,
   processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Existing accounts get a one-time migration-time trial record; no existing users are deleted.
+INSERT INTO subscriptions(user_id,trial_started_at,trial_ends_at,status)
+SELECT id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '7 days', 'trialing'
+FROM users
+ON CONFLICT(user_id) DO NOTHING;
