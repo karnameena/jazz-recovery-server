@@ -551,9 +551,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && path === "/api/auth/session") {
-      const session = requireSession(req, res);
-      if (!session) return;
-      return json(req, res, 200, { ok: true, username: session.username, expiresAt: session.expires_at });
+      const session = getSession(req);
+      if (!session) return json(req, res, 200, { ok: true, authenticated: false });
+      return json(req, res, 200, { ok: true, authenticated: true, username: session.username, expiresAt: session.expires_at });
     }
 
     if (req.method === "GET" && path === "/api/devices") {
