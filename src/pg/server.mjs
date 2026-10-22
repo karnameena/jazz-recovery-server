@@ -507,14 +507,14 @@ const server = http.createServer(async (req, res) => {
       const deviceId = String(body.deviceId || "").trim();
       const deviceToken = String(body.deviceToken || "").trim();
       const deviceName = String(body.deviceName || "").trim();
-      const imei = String(body.imei || "").replace(/[\\s-]/g, "");
+      const imei = String(body.imei || "").replace(/[\s-]/g, "");
       const ip = ipOf(req);
       if (!username || username.length > 64 || !password || password.length > 512 ||
           !/^[A-Za-z0-9._:-]{3,120}$/.test(deviceId) ||
           deviceToken.length < 32 || deviceToken.length > 512 || !/^[A-Za-z0-9_-]+$/.test(deviceToken)) {
         return json(req, res, 400, { ok: false, error: "Username, password, existing device ID and a new device token are required." });
       }
-      if (deviceName.length > 80 || (imei && !/^\\d{14,16}$/.test(imei))) {
+      if (deviceName.length > 80 || (imei && !/^\d{14,16}$/.test(imei))) {
         return json(req, res, 400, { ok: false, error: "Device name or IMEI is invalid." });
       }
       if (loginRateLimited(ip, username)) return json(req, res, 429, { ok: false, error: "Too many attempts. Try again later." }, { "Retry-After": "900" });
