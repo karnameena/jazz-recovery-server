@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS discount_redemptions (
   subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL,
   discount_percent INTEGER NOT NULL CHECK (discount_percent IN (10,20,50,100)),
   amount_paise INTEGER NOT NULL CHECK (amount_paise BETWEEN 0 AND 49900),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','redeemed','released')),
+  expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_discount_redemptions_user_code ON discount_redemptions(user_id, discount_code_id);
