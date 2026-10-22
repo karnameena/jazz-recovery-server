@@ -485,8 +485,11 @@ const server = http.createServer(async (req, res) => {
           }
           const user = await db.prepare("INSERT INTO users(username,password_hash) VALUES(?,?) RETURNING id")
             .get(username, hashSecret(password));
-          const trialClaim = await db.prepare("INSERT INTO billing_trial_claims(username_key,user_id) VALUES(LOWER(?),?) ON CONFLICT(username_key) DO NOTHING RETURNING username_key")
-            .get(username, user.id);
+          const trialPepper = String(process.env.JAZZ_TRIAL_CLAIM_PEPPER || "");
+          if (!trialPepper) throw new Error("JAZZ_TRIAL_CLAIM_PEPPER must be configured before registration.");
+          const usernameHash = crypto.createHmac("sha256", trialPepper).update(username.toLowerCase()).digest("hex");
+          const trialClaim = await db.prepare("INSERT INTO billing_trial_claims(username_hash,user_id) VALUES(?,?) ON CONFLICT(username_hash) DO NOTHING RETURNING username_hash")
+            .get(usernameHash, user.id);
           if (trialClaim) {
             await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '7 days') ON CONFLICT(user_id) DO NOTHING")
               .run(user.id);
