@@ -1,0 +1,26 @@
+name: Jazz Recovery billing feature checks
+on:
+  pull_request:
+    branches: [main, feature/recovery-enrollment-neon-20261020]
+    paths:
+      - "src/pg/**"
+      - "src/auth/**"
+      - "migrations/postgres/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/subscription-feature-checks.yml"
+  push:
+    branches: [feature/subscriptions-registration-20261022]
+jobs:
+  syntax-and-migration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: node --check src/pg/server.mjs
+      - run: node --check src/pg/database.mjs
+      - run: node --check src/entrypoint.mjs
