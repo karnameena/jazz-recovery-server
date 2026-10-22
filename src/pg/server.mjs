@@ -500,6 +500,48 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "POST" && path === "/api/auth/device-repair") {
+      const body = await readJson(req, 32 * 1024);
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      const deviceId = String(body.deviceId || "").trim();
+      const deviceToken = String(body.deviceToken || "").trim();
+      const deviceName = String(body.deviceName || "").trim();
+      const imei = String(body.imei || "").replace(/[\s-]/g, "");
+      const ip = ipOf(req);
+      if (!username || username.length > 64 || !password || password.length > 512 ||
+          !/^[A-Za-z0-9._:-]{3,120}$/.test(deviceId) ||
+          deviceToken.length < 32 || deviceToken.length > 512 || !/^[A-Za-z0-9_-]+$/.test(deviceToken)) {
+        return json(req, res, 400, { ok: false, error: "Username, password, existing device ID and a new device token are required." });
+      }
+      if (deviceName.length > 80 || (imei && !/^\d{14,16}$/.test(imei))) {
+        return json(req, res, 400, { ok: false, error: "Device name or IMEI is invalid." });
+      }
+      if (loginRateLimited(ip, username)) return json(req, res, 429, { ok: false, error: "Too many attempts. Try again later." }, { "Retry-After": "900" });
+      const user = await db.prepare("SELECT * FROM users WHERE LOWER(username)=LOWER(?)").get(username);
+      const validPassword = verifySecret(password, user?.password_hash || dummyPasswordHash);
+      if (!user || !validPassword) {
+        recordLoginFailure(ip, username);
+        await audit(user?.id ?? null, null, "DEVICE_REPAIR", "FAILED_AUTH");
+        return json(req, res, 401, { ok: false, error: "Invalid username or password." });
+      }
+      const result = await db.transaction(async () => {
+        const device = await db.prepare("SELECT * FROM devices WHERE user_id=? AND device_id=? FOR UPDATE").get(user.id, deviceId);
+        if (!device) return { missing: true };
+        await db.prepare("UPDATE devices SET credential_hash=?,device_name=COALESCE(NULLIF(?,''),device_name),imei=COALESCE(NULLIF(?,''),imei),updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?")
+          .run(hashSecret(deviceToken), deviceName, imei, device.id, user.id);
+        await audit(user.id, device.id, "DEVICE_REPAIR", "SUCCESS");
+        return { device };
+      });
+      if (result.missing) {
+        await audit(user.id, null, "DEVICE_REPAIR", "DEVICE_NOT_OWNED");
+        return json(req, res, 404, { ok: false, error: "That existing device ID is not registered to this account. Check the ID from your original pairing details." });
+      }
+      for (const key of deviceAuthCache.keys()) if (key.startsWith(String(result.device.id) + ":")) deviceAuthCache.delete(key);
+      clearLoginFailures(ip, username);
+      return json(req, res, 200, { ok: true, deviceId, message: "Existing device record re-paired. Its history and recovery state were preserved." });
+    }
+
     if (req.method === "POST" && path === "/api/auth/login") {
       const body = await readJson(req, 32 * 1024);
       const username = String(body.username || "").trim();
