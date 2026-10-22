@@ -26,3 +26,13 @@ services:
         value: None
       - key: LOST_MODE_TRUST_PROXY
         value: "true"
+      - key: JAZZ_OWNER_USERNAME
+        sync: false
+      - key: JAZZ_DISCOUNT_PEPPER
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
