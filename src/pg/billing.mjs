@@ -216,7 +216,7 @@ export async function handleBillingRequest(req, res, path, helpers) {
         if (!current) return send(req, res, 404, { ok: false, error: "Discount code not found." }), true;
         const active = body.active === undefined ? current.active : body.active;
         const percent = body.percentOff === undefined ? Number(current.percent_off) : Number(body.percentOff);
-        const expiresAt = body.expiresAt === undefined ? current.expires_at : (body.expiresAt ? new Date(body.expiresAt) : null);
+        const expiresAt = body.expiresAt === undefined ? (current.expires_at ? new Date(current.expires_at) : null) : (body.expiresAt ? new Date(body.expiresAt) : null);
         const max = body.maxRedemptions === undefined ? current.max_redemptions : (body.maxRedemptions == null || body.maxRedemptions === "" ? null : Number(body.maxRedemptions));
         if (typeof active !== "boolean" || !ALLOWED_DISCOUNTS.has(percent)) return send(req, res, 400, { ok: false, error: "Invalid active flag or discount percentage." }), true;
         if (expiresAt && (!(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()))) return send(req, res, 400, { ok: false, error: "Invalid expiry date." }), true;
