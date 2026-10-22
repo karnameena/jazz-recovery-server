@@ -108,7 +108,7 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     const base = "http://127.0.0.1:" + port;
     const app = spawn(process.execPath, ["src/entrypoint.mjs"], {
       cwd: projectRoot, env: { ...envTest, JAZZ_DB_ENGINE: "postgres", PORT: String(port),
-        LOST_MODE_COOKIE_SECURE: "false", LOST_MODE_PUBLIC_ORIGINS: "http://localhost:5190" },
+        LOST_MODE_COOKIE_SECURE: "false", LOST_MODE_PUBLIC_ORIGINS: "http://localhost:5190", JAZZ_OWNER_USERNAME: "existing-owner" },
       stdio: ["ignore", "pipe", "pipe"]
     });
     let output = "";
@@ -137,6 +137,26 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     const sessionHeaders = { Cookie: cookie };
     const session = await api("GET", "/api/auth/session", null, sessionHeaders);
     assert.equal(session.status, 200);
+
+    const adminList = await api("GET", "/api/admin/discount-codes", null, sessionHeaders);
+    assert.equal(adminList.status, 200, "Configured owner can access discount management");
+    for (const [percent, expectedPaise] of [[10,44910],[20,39920],[50,24950],[100,0]]) {
+      const createdCode = await api("POST", "/api/admin/discount-codes", {
+        code: "CI-DISCOUNT-" + percent, label: "CI " + percent + "%", discountPercent: percent,
+        maxRedemptions: 5, perUserLimit: 1
+      }, sessionHeaders);
+      assert.equal(createdCode.status, 201, "Owner can create " + percent + "% code: " + JSON.stringify(createdCode.data));
+      const validated = await api("POST", "/api/billing/discount/validate", { code: "CI-DISCOUNT-" + percent }, sessionHeaders);
+      assert.equal(validated.status, 200, "Valid discount should be accepted");
+      assert.equal(validated.data.amountPaise, expectedPaise, percent + "% discount amount must be exact in paise");
+    }
+    const complimentary = await api("POST", "/api/billing/order", { code: "CI-DISCOUNT-100" }, sessionHeaders);
+    assert.equal(complimentary.status, 200);
+    assert.equal(complimentary.data.complimentary, true, "100% code must not create a Razorpay order");
+    const subscriptionAfterFree = await api("GET", "/api/subscription", null, sessionHeaders);
+    assert.equal(subscriptionAfterFree.data.subscription.status, "complimentary");
+    const paidOrderWithoutKeys = await api("POST", "/api/billing/order", {}, sessionHeaders);
+    assert.equal(paidOrderWithoutKeys.status, 503, "Paid checkout fails closed until Razorpay secrets are configured");
 
     const devices = await api("GET", "/api/devices", null, sessionHeaders);
     assert.equal(devices.status, 200);
@@ -192,6 +212,8 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     const otherCookie={Cookie:otherLogin.cookie.split(";")[0]};
     const forbidden=await api("GET","/api/devices/"+id,null,otherCookie);
     assert.equal(forbidden.status,404,"Another owner must not see this device");
+    const forbiddenAdmin=await api("GET","/api/admin/discount-codes",null,otherCookie);
+    assert.equal(forbiddenAdmin.status,403,"Non-owner accounts must not access discount administration");
     assert.ok(user2.rows[0].id);
 
     // The existing npm admin commands must target PostgreSQL when enabled,
@@ -253,6 +275,11 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     assert.equal(registration.status, 201, "Owner registration should create account and pair device");
     assert.equal(registration.data.device.imei, "123456789012345");
     const registeredCookie = { Cookie: registration.cookie.split(";")[0] };
+    const trial = await api("GET", "/api/subscription", null, registeredCookie);
+    assert.equal(trial.status, 200);
+    assert.equal(trial.data.subscription.status, "trialing", "New registration receives a 7-day trial");
+    const trialEnd = new Date(trial.data.subscription.endsAt).getTime();
+    assert.ok(trialEnd > Date.now() + 6 * 24 * 60 * 60 * 1000, "Trial should last approximately seven days");
     const registeredDevices = await api("GET", "/api/devices", null, registeredCookie);
     assert.equal(registeredDevices.data.items.length, 1);
     assert.equal(registeredDevices.data.items[0].deviceId, "jazz-recovery-test");
