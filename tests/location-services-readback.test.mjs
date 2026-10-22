@@ -218,6 +218,44 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
   },{"Authorization":"Bearer "+registeredToken,"X-Jazz-Lost-Device-Id":"jazz-recovery-test"});
   assert.equal(registeredHeartbeat.status,200,"New device credential must authenticate");
 
+  const repairedToken=crypto.randomBytes(32).toString("base64url");
+  const repair=await json("POST","/api/auth/device-repair",{
+    username:"new-recovery-owner",
+    password:"RecoveryOwner123!",
+    deviceId:"jazz-recovery-test",
+    deviceToken:repairedToken,
+    deviceName:"Recovery Test Phone Repaired",
+    imei:"123456789012345"
+  });
+  assert.equal(repair.status,200,"Correct owner credentials should re-pair the existing device");
+  assert.equal(repair.response.deviceId,"jazz-recovery-test");
+  assert.match(repair.response.message,/history and recovery state were preserved/i);
+  const oldCredentialHeartbeat=await json("POST","/android/device/heartbeat",{
+    deviceId:"jazz-recovery-test",mode:"NORMAL_MODE",status:{battery:78,network:"WIFI"}
+  },{"Authorization":"Bearer "+registeredToken,"X-Jazz-Lost-Device-Id":"jazz-recovery-test"});
+  assert.equal(oldCredentialHeartbeat.status,401,"The replaced device token must stop authenticating");
+  const repairedHeartbeat=await json("POST","/android/device/heartbeat",{
+    deviceId:"jazz-recovery-test",mode:"NORMAL_MODE",status:{battery:79,network:"WIFI"}
+  },{"Authorization":"Bearer "+repairedToken,"X-Jazz-Lost-Device-Id":"jazz-recovery-test"});
+  assert.equal(repairedHeartbeat.status,200,"The newly generated device token must authenticate after repair");
+  const repairedDevice=await json("GET","/api/devices/"+registration.response.device.id,undefined,{Cookie:registrationCookie});
+  assert.equal(repairedDevice.status,200,"Re-pairing must preserve the existing device record");
+  assert.equal(repairedDevice.response.device.deviceId,"jazz-recovery-test");
+  const badRepair=await json("POST","/api/auth/device-repair",{
+    username:"new-recovery-owner",
+    password:"WrongPassword123!",
+    deviceId:"jazz-recovery-test",
+    deviceToken:crypto.randomBytes(32).toString("base64url")
+  });
+  assert.equal(badRepair.status,401,"Incorrect account password must never rotate a device credential");
+  const missingRepair=await json("POST","/api/auth/device-repair",{
+    username:"new-recovery-owner",
+    password:"RecoveryOwner123!",
+    deviceId:"jazz-device-not-owned",
+    deviceToken:crypto.randomBytes(32).toString("base64url")
+  });
+  assert.equal(missingRepair.status,404,"Repair must not create or take over a device that is not already owned by the account");
+
   const duplicateUsername=await json("POST","/api/auth/register",{
     ...registrationBody,username:"NEW-RECOVERY-OWNER",deviceId:"another-recovery-device",
     deviceToken:crypto.randomBytes(32).toString("base64url")
