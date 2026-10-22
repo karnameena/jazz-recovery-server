@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
+import { handleBillingRequest, startTrialForUser } from "./billing.mjs";
 
 await applyMigrations();
 
@@ -449,6 +450,8 @@ const server = http.createServer(async (req, res) => {
       return json(req, res, 200, { ok: true, service: "jazz-lost-mode-server" });
     }
 
+    if (await handleBillingRequest(req, res, path, { db, readJson, requireSession, json })) return;
+
     if (req.method === "POST" && path === "/api/auth/register") {
       const body = await readJson(req, 32 * 1024);
       const username = String(body.username || "").trim();
@@ -480,6 +483,7 @@ const server = http.createServer(async (req, res) => {
           }
           const user = await db.prepare("INSERT INTO users(username,password_hash) VALUES(?,?) RETURNING id")
             .get(username, hashSecret(password));
+          await startTrialForUser(db, user.id);
           const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
