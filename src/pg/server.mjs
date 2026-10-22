@@ -408,6 +408,100 @@ async function updateStateFromResult(device, command, result) {
   }
 }
 
+
+const ANNUAL_PRICE_PAISE = 49900;
+const TRIAL_DAYS = 7;
+const OWNER_USERNAME = String(process.env.JAZZ_OWNER_USERNAME || "").trim().toLowerCase();
+
+function discountHash(value) {
+  return crypto.createHash("sha256").update(String(value || "").trim().toUpperCase()).digest("hex");
+}
+function constantTimeTextEqual(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+function discountAmount(percent) {
+  return Math.round(ANNUAL_PRICE_PAISE * (100 - Number(percent)) / 100);
+}
+async function requireOwner(req, res) {
+  const session = await requireSession(req, res);
+  if (!session) return null;
+  if (!OWNER_USERNAME || String(session.username || "").toLowerCase() !== OWNER_USERNAME) {
+    json(req, res, 403, { ok: false, error: "Owner authorization is not configured or this account is not the owner." });
+    return null;
+  }
+  return session;
+}
+async function releaseExpiredDiscountReservations() {
+  await db.transaction(async () => {
+    const rows = await db.prepare("SELECT id,discount_code_id FROM discount_redemptions WHERE status='pending' AND expires_at <= CURRENT_TIMESTAMP FOR UPDATE").all();
+    for (const row of rows) {
+      const changed = await db.prepare("UPDATE discount_redemptions SET status='released' WHERE id=? AND status='pending'").run(row.id);
+      if (changed.changes) {
+        await db.prepare("UPDATE discount_codes SET redemption_count=GREATEST(0,redemption_count-1),updated_at=CURRENT_TIMESTAMP WHERE id=?").run(row.discount_code_id);
+      }
+    }
+  });
+}
+async function findEligibleDiscount(codeText, userId) {
+  const normalized = String(codeText || "").trim().toUpperCase();
+  if (!normalized) return null;
+  const code = await db.prepare("SELECT * FROM discount_codes WHERE code_hash=? AND is_active=TRUE AND starts_at<=CURRENT_TIMESTAMP AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)").get(discountHash(normalized));
+  if (!code) return null;
+  if (code.max_redemptions != null && Number(code.redemption_count) >= Number(code.max_redemptions)) return null;
+  const usage = await db.prepare("SELECT COUNT(*)::int AS count FROM discount_redemptions WHERE discount_code_id=? AND user_id=? AND (status='redeemed' OR (status='pending' AND expires_at>CURRENT_TIMESTAMP))").get(code.id, userId);
+  if (Number(usage?.count || 0) >= Number(code.per_user_limit || 1)) return null;
+  return code;
+}
+async function activateCapturedPayment(orderId, paymentId, amountPaise) {
+  return await db.transaction(async () => {
+    const order = await db.prepare("SELECT * FROM payment_orders WHERE razorpay_order_id=? FOR UPDATE").get(orderId);
+    if (!order) return { ok: false, reason: "unknown_order" };
+    if (Number(order.amount_paise) !== Number(amountPaise)) return { ok: false, reason: "amount_mismatch" };
+    if (order.status === "paid") return { ok: true, duplicate: true };
+    if (order.status !== "created") return { ok: false, reason: "order_not_payable" };
+    if (order.discount_code_id != null) {
+      const redemption = await db.prepare("SELECT * FROM discount_redemptions WHERE payment_order_id=? AND status='pending' FOR UPDATE").get(order.id);
+      if (!redemption) return { ok: false, reason: "discount_reservation_missing" };
+      await db.prepare("UPDATE discount_redemptions SET status='redeemed',expires_at=NULL WHERE id=?").run(redemption.id);
+    }
+    const subscription = await db.prepare("INSERT INTO subscriptions(user_id,plan,status,starts_at,ends_at,amount_paise,discount_code_id,razorpay_order_id,razorpay_payment_id) VALUES(?,'annual','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '365 days',?,?,?,?) RETURNING id")
+      .get(order.user_id, order.amount_paise, order.discount_code_id, order.razorpay_order_id, paymentId);
+    await db.prepare("UPDATE payment_orders SET status='paid',razorpay_payment_id=?,subscription_id=?,fulfilled_at=CURRENT_TIMESTAMP WHERE id=?")
+      .run(paymentId, subscription.id, order.id);
+    await db.prepare("INSERT INTO subscription_audit(user_id,action,details) VALUES(?,?,?::jsonb)")
+      .run(order.user_id, "SUBSCRIPTION_ACTIVATED", JSON.stringify({ orderId, paymentId, amountPaise: Number(amountPaise) }));
+    return { ok: true, subscriptionId: subscription.id };
+  });
+}
+async function releaseOrderReservation(orderId, status = "failed") {
+  await db.transaction(async () => {
+    const order = await db.prepare("SELECT * FROM payment_orders WHERE razorpay_order_id=? FOR UPDATE").get(orderId);
+    if (!order || order.status !== "created") return;
+    await db.prepare("UPDATE payment_orders SET status=? WHERE id=?").run(status, order.id);
+    const reservations = await db.prepare("SELECT id,discount_code_id FROM discount_redemptions WHERE payment_order_id=? AND status='pending' FOR UPDATE").all(order.id);
+    for (const row of reservations) {
+      await db.prepare("UPDATE discount_redemptions SET status='released' WHERE id=?").run(row.id);
+      await db.prepare("UPDATE discount_codes SET redemption_count=GREATEST(0,redemption_count-1),updated_at=CURRENT_TIMESTAMP WHERE id=?").run(row.discount_code_id);
+    }
+  });
+}
+async function readRawBody(req, maxBytes = 1024 * 1024) {
+  return await new Promise((resolve, reject) => {
+    let raw = "";
+    let tooLarge = false;
+    req.setEncoding("utf8");
+    req.on("data", chunk => {
+      if (tooLarge) return;
+      raw += chunk;
+      if (Buffer.byteLength(raw) > maxBytes) { tooLarge = true; raw = ""; }
+    });
+    req.on("end", () => tooLarge ? reject(new HttpError(413, "Webhook body too large")) : resolve(raw));
+    req.on("error", () => reject(new HttpError(400, "Invalid webhook body")));
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const path = url.pathname;
@@ -478,8 +572,10 @@ const server = http.createServer(async (req, res) => {
           if (await db.prepare("SELECT id FROM devices WHERE device_id=?").get(deviceId)) {
             return { conflict: "This device token ID is already registered." };
           }
-          const user = await db.prepare("INSERT INTO users(username,password_hash) VALUES(?,?) RETURNING id")
+          const user = await db.prepare("INSERT INTO users(username,password_hash,trial_started_at,trial_ends_at,trial_used_at) VALUES(?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '7 days',CURRENT_TIMESTAMP) RETURNING id")
             .get(username, hashSecret(password));
+          await db.prepare("INSERT INTO subscriptions(user_id,plan,status,starts_at,ends_at,amount_paise) VALUES(?,'annual','trialing',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '7 days',?)")
+            .run(user.id, ANNUAL_PRICE_PAISE);
           const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
@@ -538,6 +634,174 @@ const server = http.createServer(async (req, res) => {
       const session = await requireSession(req, res);
       if (!session) return;
       return json(req, res, 200, { ok: true, username: session.username, expiresAt: session.expires_at });
+    }
+
+
+    if (req.method === "GET" && path === "/api/subscription") {
+      const session = await requireSession(req, res); if (!session) return;
+      const row = await db.prepare("SELECT status,starts_at,ends_at,amount_paise,discount_code_id FROM subscriptions WHERE user_id=? ORDER BY ends_at DESC, id DESC LIMIT 1").get(session.user_id);
+      const status = row && row.status === "trialing" && new Date(row.ends_at).getTime() <= Date.now() ? "expired" : (row?.status || "none");
+      return json(req, res, 200, { ok: true, subscription: row ? { status, startsAt: row.starts_at, endsAt: row.ends_at, amountPaise: Number(row.amount_paise) } : { status: "none" }, annualPricePaise: ANNUAL_PRICE_PAISE, trialDays: TRIAL_DAYS });
+    }
+
+    if (req.method === "POST" && path === "/api/billing/discount/validate") {
+      const session = await requireSession(req, res); if (!session) return;
+      await releaseExpiredDiscountReservations();
+      const body = await readJson(req, 16 * 1024);
+      const code = await findEligibleDiscount(body.code, session.user_id);
+      if (!code) return json(req, res, 400, { ok: false, error: "Discount code is invalid, expired, disabled, or has reached its redemption limit." });
+      return json(req, res, 200, { ok: true, discountPercent: Number(code.discount_percent), amountPaise: discountAmount(code.discount_percent), savingsPaise: ANNUAL_PRICE_PAISE - discountAmount(code.discount_percent) });
+    }
+
+    if (req.method === "POST" && path === "/api/billing/order") {
+      const session = await requireSession(req, res); if (!session) return;
+      const body = await readJson(req, 16 * 1024);
+      const codeText = String(body.code || "").trim().toUpperCase();
+      await releaseExpiredDiscountReservations();
+      const discount = codeText ? await findEligibleDiscount(codeText, session.user_id) : null;
+      if (codeText && !discount) return json(req, res, 400, { ok: false, error: "Discount code is invalid, expired, disabled, or has reached its redemption limit." });
+      const percent = Number(discount?.discount_percent || 0);
+      const amountPaise = discount ? discountAmount(percent) : ANNUAL_PRICE_PAISE;
+      if (percent === 100) {
+        const granted = await db.transaction(async () => {
+          const locked = await db.prepare("SELECT * FROM discount_codes WHERE id=? FOR UPDATE").get(discount.id);
+          if (!locked || !locked.is_active || (locked.expires_at && new Date(locked.expires_at).getTime() <= Date.now()) || (locked.max_redemptions != null && Number(locked.redemption_count) >= Number(locked.max_redemptions))) return false;
+          const usage = await db.prepare("SELECT COUNT(*)::int AS count FROM discount_redemptions WHERE discount_code_id=? AND user_id=? AND status IN ('pending','redeemed')").get(locked.id, session.user_id);
+          if (Number(usage?.count || 0) >= Number(locked.per_user_limit || 1)) return false;
+          const sub = await db.prepare("INSERT INTO subscriptions(user_id,plan,status,starts_at,ends_at,amount_paise,discount_code_id) VALUES(?,'annual','complimentary',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '365 days',0,?) RETURNING id").get(session.user_id, locked.id);
+          await db.prepare("INSERT INTO discount_redemptions(discount_code_id,user_id,subscription_id,discount_percent,amount_paise,status) VALUES(?,?,?,?,0,'redeemed')").run(locked.id, session.user_id, sub.id, percent);
+          await db.prepare("UPDATE discount_codes SET redemption_count=redemption_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(locked.id);
+          await db.prepare("INSERT INTO subscription_audit(user_id,action,details) VALUES(?,?,?::jsonb)").run(session.user_id, "COMPLIMENTARY_SUBSCRIPTION_GRANTED", JSON.stringify({ discountCodeId: locked.id }));
+          return true;
+        });
+        if (!granted) return json(req, res, 409, { ok: false, error: "This discount code has reached its redemption limit. Please try another code." });
+        return json(req, res, 200, { ok: true, complimentary: true, amountPaise: 0, message: "Complimentary annual access activated." });
+      }
+      const keyId = String(process.env.RAZORPAY_KEY_ID || "");
+      const keySecret = String(process.env.RAZORPAY_KEY_SECRET || "");
+      if (!keyId || !keySecret) return json(req, res, 503, { ok: false, error: "Online payments are not configured yet." });
+      const receipt = "jazz-" + crypto.randomUUID();
+      const razorResponse = await fetch("https://api.razorpay.com/v1/orders", {
+        method: "POST",
+        headers: { "Authorization": "Basic " + Buffer.from(keyId + ":" + keySecret).toString("base64"), "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: amountPaise, currency: "INR", receipt, notes: { userId: String(session.user_id), discountPercent: String(percent) } })
+      });
+      const razorOrder = await razorResponse.json().catch(() => ({}));
+      if (!razorResponse.ok || !razorOrder.id || Number(razorOrder.amount) !== amountPaise) {
+        console.error("[Jazz Billing] Razorpay order creation failed:", razorOrder.error?.code || razorResponse.status);
+        return json(req, res, 502, { ok: false, error: "Could not create a secure payment order. Please try again." });
+      }
+      const saved = await db.transaction(async () => {
+        let locked = null;
+        if (discount) {
+          locked = await db.prepare("SELECT * FROM discount_codes WHERE id=? FOR UPDATE").get(discount.id);
+          if (!locked || !locked.is_active || (locked.expires_at && new Date(locked.expires_at).getTime() <= Date.now()) || (locked.max_redemptions != null && Number(locked.redemption_count) >= Number(locked.max_redemptions))) return null;
+          const usage = await db.prepare("SELECT COUNT(*)::int AS count FROM discount_redemptions WHERE discount_code_id=? AND user_id=? AND (status='redeemed' OR (status='pending' AND expires_at>CURRENT_TIMESTAMP))").get(locked.id, session.user_id);
+          if (Number(usage?.count || 0) >= Number(locked.per_user_limit || 1)) return null;
+        }
+        const order = await db.prepare("INSERT INTO payment_orders(user_id,razorpay_order_id,amount_paise,currency,discount_code_id) VALUES(?,?,?,'INR',?) RETURNING id")
+          .get(session.user_id, razorOrder.id, amountPaise, locked?.id || null);
+        if (locked) {
+          await db.prepare("INSERT INTO discount_redemptions(discount_code_id,user_id,payment_order_id,discount_percent,amount_paise,status,expires_at) VALUES(?,?,?,?,?,'pending',CURRENT_TIMESTAMP + INTERVAL '15 minutes')").run(locked.id, session.user_id, order.id, percent, amountPaise);
+          await db.prepare("UPDATE discount_codes SET redemption_count=redemption_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(locked.id);
+        }
+        return { id: order.id, discountCodeId: locked?.id || null };
+      });
+      if (!saved) return json(req, res, 409, { ok: false, error: "The discount code was just used or disabled. Please retry with a valid code." });
+      return json(req, res, 201, { ok: true, keyId, orderId: razorOrder.id, amountPaise, currency: "INR", discountPercent: percent, discountCodeId: saved.discountCodeId });
+    }
+
+    if (req.method === "POST" && path === "/api/billing/verify") {
+      const session = await requireSession(req, res); if (!session) return;
+      const body = await readJson(req, 16 * 1024);
+      const orderId = String(body.razorpay_order_id || "");
+      const paymentId = String(body.razorpay_payment_id || "");
+      const signature = String(body.razorpay_signature || "");
+      if (!orderId || !paymentId || !signature) return json(req, res, 400, { ok: false, error: "Missing payment verification fields." });
+      const keySecret = String(process.env.RAZORPAY_KEY_SECRET || "");
+      if (!keySecret || !constantTimeTextEqual(crypto.createHmac("sha256", keySecret).update(orderId + "|" + paymentId).digest("hex"), signature)) {
+        return json(req, res, 400, { ok: false, error: "Payment signature verification failed." });
+      }
+      const order = await db.prepare("SELECT * FROM payment_orders WHERE razorpay_order_id=? AND user_id=?").get(orderId, session.user_id);
+      if (!order) return json(req, res, 404, { ok: false, error: "Payment order not found." });
+      const keyId = String(process.env.RAZORPAY_KEY_ID || "");
+      const paymentResponse = await fetch("https://api.razorpay.com/v1/payments/" + encodeURIComponent(paymentId), {
+        headers: { "Authorization": "Basic " + Buffer.from(keyId + ":" + keySecret).toString("base64") }
+      });
+      const payment = await paymentResponse.json().catch(() => ({}));
+      if (!paymentResponse.ok || payment.order_id !== orderId || payment.status !== "captured" || Number(payment.amount) !== Number(order.amount_paise)) {
+        return json(req, res, 409, { ok: false, error: "Payment is not captured or does not match the order. Access has not been activated." });
+      }
+      const result = await activateCapturedPayment(orderId, paymentId, payment.amount);
+      if (!result.ok) return json(req, res, 409, { ok: false, error: "Payment needs review before subscription activation." });
+      return json(req, res, 200, { ok: true, subscriptionActivated: true, duplicate: Boolean(result.duplicate) });
+    }
+
+    if (req.method === "POST" && path === "/api/billing/razorpay-webhook") {
+      const raw = await readRawBody(req);
+      const webhookSecret = String(process.env.RAZORPAY_WEBHOOK_SECRET || "");
+      const signature = String(req.headers["x-razorpay-signature"] || "");
+      if (!webhookSecret || !constantTimeTextEqual(crypto.createHmac("sha256", webhookSecret).update(raw).digest("hex"), signature)) {
+        return json(req, res, 400, { ok: false, error: "Invalid webhook signature." });
+      }
+      let event;
+      try { event = JSON.parse(raw); } catch { return json(req, res, 400, { ok: false, error: "Invalid webhook JSON." }); }
+      const payment = event?.payload?.payment?.entity;
+      if (event.event === "payment.captured" && payment?.order_id && payment?.id) {
+        const result = await activateCapturedPayment(payment.order_id, payment.id, payment.amount);
+        if (!result.ok) return json(req, res, 409, { ok: false, error: "Captured payment could not be reconciled." });
+      } else if (event.event === "payment.failed" && payment?.order_id) {
+        await releaseOrderReservation(payment.order_id, "failed");
+      }
+      return json(req, res, 200, { ok: true, received: true });
+    }
+
+    if (req.method === "GET" && path === "/api/admin/discount-codes") {
+      const owner = await requireOwner(req, res); if (!owner) return;
+      const rows = await db.prepare("SELECT id,code_label,discount_percent,starts_at,expires_at,max_redemptions,per_user_limit,redemption_count,is_active,created_at,updated_at FROM discount_codes ORDER BY created_at DESC").all();
+      return json(req, res, 200, { ok: true, items: rows });
+    }
+
+    if (req.method === "POST" && path === "/api/admin/discount-codes") {
+      const owner = await requireOwner(req, res); if (!owner) return;
+      const body = await readJson(req, 16 * 1024);
+      const code = String(body.code || "").trim().toUpperCase();
+      const label = String(body.label || "").trim().slice(0, 80) || "Promotion";
+      const percent = Number(body.discountPercent);
+      const maxRedemptions = body.maxRedemptions == null || body.maxRedemptions === "" ? null : Number(body.maxRedemptions);
+      const perUserLimit = body.perUserLimit == null || body.perUserLimit === "" ? 1 : Number(body.perUserLimit);
+      const expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
+      if (!/^[A-Z0-9_-]{4,64}$/.test(code)) return json(req, res, 400, { ok: false, error: "Code must be 4–64 letters, numbers, underscores or hyphens." });
+      if (![10,20,50,100].includes(percent)) return json(req, res, 400, { ok: false, error: "Discount must be 10%, 20%, 50%, or 100%." });
+      if (maxRedemptions != null && (!Number.isInteger(maxRedemptions) || maxRedemptions < 1 || maxRedemptions > 1000000)) return json(req, res, 400, { ok: false, error: "Invalid maximum redemption count." });
+      if (!Number.isInteger(perUserLimit) || perUserLimit < 1 || perUserLimit > 100) return json(req, res, 400, { ok: false, error: "Invalid per-user redemption limit." });
+      if (body.expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) return json(req, res, 400, { ok: false, error: "Expiry must be a future date." });
+      try {
+        const row = await db.prepare("INSERT INTO discount_codes(code_hash,code_label,discount_percent,expires_at,max_redemptions,per_user_limit,created_by) VALUES(?,?,?,?,?,?,?) RETURNING id,code_label,discount_percent,expires_at,max_redemptions,per_user_limit,is_active")
+          .get(discountHash(code), label, percent, expiresAt, maxRedemptions, perUserLimit, owner.user_id);
+        await db.prepare("INSERT INTO subscription_audit(actor_user_id,action,details) VALUES(?,?,?::jsonb)").run(owner.user_id, "DISCOUNT_CODE_CREATED", JSON.stringify({ discountCodeId: row.id, label, percent }));
+        return json(req, res, 201, { ok: true, item: row, codeCreated: true });
+      } catch (error) {
+        if (error?.code === "23505") return json(req, res, 409, { ok: false, error: "That discount code already exists." });
+        throw error;
+      }
+    }
+
+    const discountAdminMatch = path.match(/^\/api\/admin\/discount-codes\/(\d+)$/);
+    if (req.method === "PATCH" && discountAdminMatch) {
+      const owner = await requireOwner(req, res); if (!owner) return;
+      const body = await readJson(req, 16 * 1024);
+      if (typeof body.isActive !== "boolean" && body.expiresAt === undefined) return json(req, res, 400, { ok: false, error: "Provide isActive or expiresAt." });
+      const current = await db.prepare("SELECT id FROM discount_codes WHERE id=?").get(Number(discountAdminMatch[1]));
+      if (!current) return json(req, res, 404, { ok: false, error: "Discount code not found." });
+      if (typeof body.isActive === "boolean") await db.prepare("UPDATE discount_codes SET is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(body.isActive, current.id);
+      if (body.expiresAt !== undefined) {
+        const expires = body.expiresAt ? new Date(body.expiresAt) : null;
+        if (body.expiresAt && !Number.isFinite(expires.getTime())) return json(req, res, 400, { ok: false, error: "Invalid expiry date." });
+        await db.prepare("UPDATE discount_codes SET expires_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(expires, current.id);
+      }
+      await db.prepare("INSERT INTO subscription_audit(actor_user_id,action,details) VALUES(?,?,?::jsonb)").run(owner.user_id, "DISCOUNT_CODE_UPDATED", JSON.stringify({ discountCodeId: current.id, isActive: body.isActive ?? null }));
+      return json(req, res, 200, { ok: true });
     }
 
     if (req.method === "GET" && path === "/api/devices") {
