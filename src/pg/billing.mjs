@@ -94,118 +94,120 @@ async function grantAnnual(db, { userId, orderId = null, paymentId = null, compl
     await db.prepare("UPDATE subscriptions SET paid_started_at=?,paid_ends_at=?,status=?,last_payment_id=?,last_order_id=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?")
       .run(new Date(start).toISOString(), new Date(end).toISOString(), complimentary ? "complimentary" : "active", paymentId, orderId, userId);
     if (discount) {
-      await db.prepare("INSERT INTO discount_redemptions(discount_code_id,user_id,subscription_id,percent_off,amount_paise) VALUES(?,?,?,?,?) ON CONFLICT(discount_code_id,user_id) DO NOTHING")
+      const redemption = await db.prepare("INSERT INTO discount_redemptions(discount_code_id,user_id,subscription_id,percent_off,amount_paise) VALUES(?,?,?,?,?) ON CONFLICT(discount_code_id,user_id) DO NOTHING")
         .run(discount.id, userId, existing.id, discount.percent_off, amountPaise);
-      await db.prepare("UPDATE discount_codes SET redemption_count=redemption_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(discount.id);
+      if (redemption.changes) await db.prepare("UPDATE discount_codes SET redemption_count=redemption_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(discount.id);
     }
   });
 }
-async function handleWebhook(req, res, { db }) {
+async function handleWebhook(req, res, { db, json: sendJson }) {
+  const send = sendJson || json;
   const secret = String(process.env.RAZORPAY_WEBHOOK_SECRET || "").trim();
-  if (!secret) return json(req, res, 503, { ok: false, error: "Webhook is not configured" });
+  if (!secret) return send(req, res, 503, { ok: false, error: "Webhook is not configured" });
   const body = await rawBody(req);
   const supplied = String(req.headers["x-razorpay-signature"] || "");
   const expected = crypto.createHmac("sha256", secret).update(body).digest("hex");
-  if (!equalHex(supplied, expected)) return json(req, res, 401, { ok: false, error: "Invalid webhook signature" });
+  if (!equalHex(supplied, expected)) return send(req, res, 401, { ok: false, error: "Invalid webhook signature" });
   const event = JSON.parse(body.toString("utf8"));
   const eventId = String(req.headers["x-razorpay-event-id"] || "").trim();
-  if (!eventId || !event.event) return json(req, res, 400, { ok: false, error: "Missing webhook event ID" });
-  if (event.event !== "payment.captured" && event.event !== "order.paid") {
+  if (!eventId || !event.event) return send(req, res, 400, { ok: false, error: "Missing webhook event ID" });
+  if (event.event !== "payment.captured") {
     await db.prepare("INSERT INTO payment_webhook_events(event_id,event_type) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING").run(eventId, event.event);
-    return json(req, res, 200, { ok: true, ignored: true });
+    return send(req, res, 200, { ok: true, ignored: true });
   }
   const payment = event.payload?.payment?.entity;
   const order = event.payload?.order?.entity;
   const orderId = String(payment?.order_id || order?.id || "");
   const paymentId = String(payment?.id || "");
-  if (!orderId || !paymentId || payment?.status !== "captured") return json(req, res, 400, { ok: false, error: "Payment is not captured" });
+  if (!orderId || !paymentId || payment?.status !== "captured") return send(req, res, 400, { ok: false, error: "Payment is not captured" });
   const priorEvent = await db.prepare("SELECT event_id FROM payment_webhook_events WHERE event_id=?").get(eventId);
-  if (priorEvent) return json(req, res, 200, { ok: true, duplicate: true });
+  if (priorEvent) return send(req, res, 200, { ok: true, duplicate: true });
   const attempt = await db.prepare("SELECT * FROM payment_orders WHERE provider_order_id=?").get(orderId);
   if (!attempt || Number(payment.amount) !== Number(attempt.amount_paise) || String(payment.currency) !== "INR") {
-    return json(req, res, 400, { ok: false, error: "Payment does not match the expected order" });
+    return send(req, res, 400, { ok: false, error: "Payment does not match the expected order" });
   }
+  await grantAnnual(db, { userId: attempt.user_id, orderId, paymentId, discount: attempt.discount_code_id ? await db.prepare("SELECT * FROM discount_codes WHERE id=?").get(attempt.discount_code_id) : null, amountPaise: attempt.amount_paise });
   await db.transaction(async () => {
     await db.prepare("INSERT INTO payment_webhook_events(event_id,event_type) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING").run(eventId, event.event);
     await db.prepare("UPDATE payment_orders SET status='paid',paid_at=CURRENT_TIMESTAMP WHERE provider_order_id=? AND status='created'").run(orderId);
   });
-  await grantAnnual(db, { userId: attempt.user_id, orderId, paymentId, discount: attempt.discount_code_id ? await db.prepare("SELECT * FROM discount_codes WHERE id=?").get(attempt.discount_code_id) : null, amountPaise: attempt.amount_paise });
-  return json(req, res, 200, { ok: true });
+  return send(req, res, 200, { ok: true });
 }
 export async function handleBillingRequest(req, res, path, helpers) {
   const { db, readJson, requireSession } = helpers;
-  if (req.method === "POST" && path === "/api/billing/webhook") return await handleWebhook(req, res, { db }), true;
+  const send = helpers.json || json;
+  if (req.method === "POST" && path === "/api/billing/webhook") return await handleWebhook(req, res, { db, json: send }), true;
   if (!path.startsWith("/api/billing/") && !path.startsWith("/api/admin/discount-codes")) return false;
   const session = await requireSession(req, res);
   if (!session) return true;
   try {
     if (req.method === "GET" && path === "/api/billing/status") {
       const sub = await subscriptionFor(db, session.user_id);
-      return json(req, res, 200, { ok: true, pricePaise: ANNUAL_PRICE_PAISE, subscription: currentSubscription(sub) }), true;
+      return send(req, res, 200, { ok: true, pricePaise: ANNUAL_PRICE_PAISE, subscription: currentSubscription(sub) }), true;
     }
     if (req.method === "POST" && path === "/api/billing/discount/validate") {
       const body = await readJson(req, 16 * 1024);
       const result = await validateDiscount(db, body.code, session.user_id);
-      if (result.error) return json(req, res, 400, { ok: false, error: result.error }), true;
-      return json(req, res, 200, { ok: true, percentOff: result.row.percent_off, amountPaise: result.amountPaise }), true;
+      if (result.error) return send(req, res, 400, { ok: false, error: result.error }), true;
+      return send(req, res, 200, { ok: true, percentOff: result.row.percent_off, amountPaise: result.amountPaise }), true;
     }
     if (req.method === "POST" && path === "/api/billing/checkout") {
       const body = await readJson(req, 16 * 1024);
       const sub = await subscriptionFor(db, session.user_id);
       const state = currentSubscription(sub);
-      if (state.access && state.status !== "trialing") return json(req, res, 409, { ok: false, error: "An annual subscription is already active." }), true;
+      if (state.access && state.status !== "trialing") return send(req, res, 409, { ok: false, error: "An annual subscription is already active." }), true;
       let discount = null, amountPaise = ANNUAL_PRICE_PAISE;
       if (body.code) {
         const result = await validateDiscount(db, body.code, session.user_id);
-        if (result.error) return json(req, res, 400, { ok: false, error: result.error }), true;
+        if (result.error) return send(req, res, 400, { ok: false, error: result.error }), true;
         discount = result.row; amountPaise = result.amountPaise;
       }
       if (amountPaise === 0 && discount?.percent_off === 100) {
         await grantAnnual(db, { userId: session.user_id, complimentary: true, discount, amountPaise: 0 });
-        return json(req, res, 200, { ok: true, complimentary: true, subscription: currentSubscription(await subscriptionFor(db, session.user_id)) }), true;
+        return send(req, res, 200, { ok: true, complimentary: true, subscription: currentSubscription(await subscriptionFor(db, session.user_id)) }), true;
       }
       const order = await razorpayRequest("/orders", { amount: amountPaise, currency: "INR", receipt: "jazz-" + crypto.randomUUID(), notes: { user_id: String(session.user_id), discount_code_id: discount ? String(discount.id) : "" } });
       await db.prepare("INSERT INTO payment_orders(user_id,discount_code_id,provider_order_id,amount_paise) VALUES(?,?,?,?)")
         .run(session.user_id, discount?.id ?? null, order.id, amountPaise);
-      return json(req, res, 200, { ok: true, keyId: process.env.RAZORPAY_KEY_ID, orderId: order.id, amountPaise, currency: "INR", description: "Jazz Recovery annual subscription" }), true;
+      return send(req, res, 200, { ok: true, keyId: process.env.RAZORPAY_KEY_ID, orderId: order.id, amountPaise, currency: "INR", description: "Jazz Recovery annual subscription" }), true;
     }
     if (path.startsWith("/api/admin/discount-codes")) {
-      if (!ownerAllowed(session)) return json(req, res, 403, { ok: false, error: "Owner authorization required." }), true;
+      if (!ownerAllowed(session)) return send(req, res, 403, { ok: false, error: "Owner authorization required." }), true;
       if (req.method === "GET") {
         const rows = await db.prepare("SELECT id,code_hint,percent_off,active,expires_at,max_redemptions,redemption_count,created_at,updated_at FROM discount_codes ORDER BY created_at DESC LIMIT 200").all();
-        return json(req, res, 200, { ok: true, items: rows }), true;
+        return send(req, res, 200, { ok: true, items: rows }), true;
       }
       if (req.method === "POST") {
         const body = await readJson(req, 16 * 1024);
         const code = safeCode(body.code);
         const percent = Number(body.percentOff);
-        if (!code || !ALLOWED_DISCOUNTS.has(percent)) return json(req, res, 400, { ok: false, error: "Use a valid code and a 10%, 20%, 50%, or 100% discount." }), true;
+        if (!code || !ALLOWED_DISCOUNTS.has(percent)) return send(req, res, 400, { ok: false, error: "Use a valid code and a 10%, 20%, 50%, or 100% discount." }), true;
         const expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
         const max = body.maxRedemptions == null || body.maxRedemptions === "" ? null : Number(body.maxRedemptions);
-        if (expiresAt && !Number.isFinite(expiresAt.getTime())) return json(req, res, 400, { ok: false, error: "Invalid expiry date." }), true;
-        if (max != null && (!Number.isInteger(max) || max < 1 || max > 1000000)) return json(req, res, 400, { ok: false, error: "Invalid redemption limit." }), true;
+        if (expiresAt && !Number.isFinite(expiresAt.getTime())) return send(req, res, 400, { ok: false, error: "Invalid expiry date." }), true;
+        if (max != null && (!Number.isInteger(max) || max < 1 || max > 1000000)) return send(req, res, 400, { ok: false, error: "Invalid redemption limit." }), true;
         try {
           await db.prepare("INSERT INTO discount_codes(code_hash,code_hint,percent_off,expires_at,max_redemptions,created_by) VALUES(?,?,?,?,?,?)")
             .run(codeDigest(code), code.slice(-4), percent, expiresAt?.toISOString() ?? null, max, session.username);
         } catch (error) {
-          if (error?.code === "23505") return json(req, res, 409, { ok: false, error: "That code already exists. Disable it before creating a replacement." }), true;
+          if (error?.code === "23505") return send(req, res, 409, { ok: false, error: "That code already exists. Disable it before creating a replacement." }), true;
           throw error;
         }
-        return json(req, res, 201, { ok: true, message: "Discount code created. Save the code securely; it is not stored in readable form." }), true;
+        return send(req, res, 201, { ok: true, message: "Discount code created. Save the code securely; it is not stored in readable form." }), true;
       }
       const match = path.match(/^\/api\/admin\/discount-codes\/(\d+)$/);
       if (req.method === "PATCH" && match) {
         const body = await readJson(req, 16 * 1024);
         const active = body.active;
-        if (typeof active !== "boolean") return json(req, res, 400, { ok: false, error: "active must be true or false." }), true;
+        if (typeof active !== "boolean") return send(req, res, 400, { ok: false, error: "active must be true or false." }), true;
         const result = await db.prepare("UPDATE discount_codes SET active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(active, Number(match[1]));
-        return json(req, res, result.changes ? 200 : 404, { ok: Boolean(result.changes) }), true;
+        return send(req, res, result.changes ? 200 : 404, { ok: Boolean(result.changes) }), true;
       }
     }
-    return json(req, res, 404, { ok: false, error: "Not found" }), true;
+    return send(req, res, 404, { ok: false, error: "Not found" }), true;
   } catch (error) {
     const status = Number(error?.status) || 500;
     if (status >= 500) console.error("[Jazz Billing] " + (error instanceof Error ? error.message : String(error)));
-    return json(req, res, status, { ok: false, error: status < 500 ? error.message : "Billing service error" }), true;
+    return send(req, res, status, { ok: false, error: status < 500 ? error.message : "Billing service error" }), true;
   }
 }
