@@ -87,12 +87,24 @@ async function grantAnnual(db, { userId, orderId = null, paymentId = null, compl
     const existing = await db.prepare("SELECT * FROM subscriptions WHERE user_id=? FOR UPDATE").get(userId);
     if (!existing) throw new Error("Subscription record missing");
     if (paymentId && await db.prepare("SELECT user_id FROM subscriptions WHERE last_payment_id=?").get(paymentId)) return;
+    if (discount && complimentary) {
+      const lockedDiscount = await db.prepare("SELECT * FROM discount_codes WHERE id=? FOR UPDATE").get(discount.id);
+      if (!lockedDiscount || !lockedDiscount.active ||
+          (lockedDiscount.expires_at && new Date(lockedDiscount.expires_at).getTime() <= Date.now()) ||
+          (lockedDiscount.max_redemptions != null && Number(lockedDiscount.redemption_count) >= Number(lockedDiscount.max_redemptions))) {
+        throw Object.assign(new Error("This complimentary code is no longer available."), { status: 409 });
+      }
+      const alreadyRedeemed = await db.prepare("SELECT id FROM discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id, userId);
+      if (alreadyRedeemed) return;
+    }
     const now = Date.now();
     const oldEnd = existing.paid_ends_at ? new Date(existing.paid_ends_at).getTime() : 0;
     const start = oldEnd > now ? oldEnd : now;
     const end = start + YEAR_MS;
     await db.prepare("UPDATE subscriptions SET paid_started_at=?,paid_ends_at=?,status=?,last_payment_id=?,last_order_id=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?")
       .run(new Date(start).toISOString(), new Date(end).toISOString(), complimentary ? "complimentary" : "active", paymentId, orderId, userId);
+    await db.prepare("INSERT INTO recovery_audit(user_id,device_id,action,status) VALUES(?,NULL,?,?)")
+      .run(userId, complimentary ? "COMPLIMENTARY_ANNUAL" : "SUBSCRIPTION_ANNUAL_GRANTED", complimentary ? "SUCCESS" : "PAYMENT_VERIFIED");
     if (discount) {
       const redemption = await db.prepare("INSERT INTO discount_redemptions(discount_code_id,user_id,subscription_id,percent_off,amount_paise) VALUES(?,?,?,?,?) ON CONFLICT(discount_code_id,user_id) DO NOTHING")
         .run(discount.id, userId, existing.id, discount.percent_off, amountPaise);
@@ -193,6 +205,7 @@ export async function handleBillingRequest(req, res, path, helpers) {
           if (error?.code === "23505") return send(req, res, 409, { ok: false, error: "That code already exists. Disable it before creating a replacement." }), true;
           throw error;
         }
+        await db.prepare("INSERT INTO recovery_audit(user_id,device_id,action,status) VALUES(?,NULL,'DISCOUNT_CREATE',?)").run(session.user_id, percent + "%");
         return send(req, res, 201, { ok: true, message: "Discount code created. Save the code securely; it is not stored in readable form." }), true;
       }
       const match = path.match(/^\/api\/admin\/discount-codes\/(\d+)$/);
@@ -201,6 +214,7 @@ export async function handleBillingRequest(req, res, path, helpers) {
         const active = body.active;
         if (typeof active !== "boolean") return send(req, res, 400, { ok: false, error: "active must be true or false." }), true;
         const result = await db.prepare("UPDATE discount_codes SET active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(active, Number(match[1]));
+        if (result.changes) await db.prepare("INSERT INTO recovery_audit(user_id,device_id,action,status) VALUES(?,NULL,?,?)").run(session.user_id, active ? "DISCOUNT_ENABLE" : "DISCOUNT_DISABLE", String(match[1]));
         return send(req, res, result.changes ? 200 : 404, { ok: Boolean(result.changes) }), true;
       }
     }
