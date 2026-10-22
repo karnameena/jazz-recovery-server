@@ -74,8 +74,11 @@ async function validateDiscount(db, codeRaw, userId) {
   const code = safeCode(codeRaw);
   if (!code) return { error: "Enter a valid discount code." };
   const row = await db.prepare("SELECT * FROM discount_codes WHERE code_hash=?").get(codeDigest(code));
-  if (!row || !row.active || (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) ||
-      (row.max_redemptions != null && Number(row.redemption_count) >= Number(row.max_redemptions))) {
+  if (!row || !row.active || (row.expires_at && new Date(row.expires_at).getTime() <= Date.now())) {
+    return { error: "This discount code is invalid, expired, disabled, or fully redeemed." };
+  }
+  const pending = Number((await db.prepare("SELECT COUNT(*) AS total FROM payment_orders WHERE discount_code_id=? AND status='created' AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 minutes'").get(row.id))?.total || 0);
+  if (row.max_redemptions != null && Number(row.redemption_count) + pending >= Number(row.max_redemptions)) {
     return { error: "This discount code is invalid, expired, disabled, or fully redeemed." };
   }
   const prior = await db.prepare("SELECT id FROM discount_redemptions WHERE discount_code_id=? AND user_id=?").get(row.id, userId);
@@ -110,6 +113,7 @@ async function grantAnnual(db, { userId, orderId = null, paymentId = null, compl
         .run(discount.id, userId, existing.id, discount.percent_off, amountPaise);
       if (redemption.changes) await db.prepare("UPDATE discount_codes SET redemption_count=redemption_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(discount.id);
     }
+    if (orderId) await db.prepare("UPDATE payment_orders SET status='paid',paid_at=CURRENT_TIMESTAMP WHERE provider_order_id=? AND status='created'").run(orderId);
   });
 }
 async function handleWebhook(req, res, { db, json: sendJson }) {
@@ -141,7 +145,6 @@ async function handleWebhook(req, res, { db, json: sendJson }) {
   await grantAnnual(db, { userId: attempt.user_id, orderId, paymentId, discount: attempt.discount_code_id ? await db.prepare("SELECT * FROM discount_codes WHERE id=?").get(attempt.discount_code_id) : null, amountPaise: attempt.amount_paise });
   await db.transaction(async () => {
     await db.prepare("INSERT INTO payment_webhook_events(event_id,event_type) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING").run(eventId, event.event);
-    await db.prepare("UPDATE payment_orders SET status='paid',paid_at=CURRENT_TIMESTAMP WHERE provider_order_id=? AND status='created'").run(orderId);
   });
   return send(req, res, 200, { ok: true });
 }
@@ -179,8 +182,19 @@ export async function handleBillingRequest(req, res, path, helpers) {
         return send(req, res, 200, { ok: true, complimentary: true, subscription: currentSubscription(await subscriptionFor(db, session.user_id)) }), true;
       }
       const order = await razorpayRequest("/orders", { amount: amountPaise, currency: "INR", receipt: "jazz-" + crypto.randomUUID(), notes: { user_id: String(session.user_id), discount_code_id: discount ? String(discount.id) : "" } });
-      await db.prepare("INSERT INTO payment_orders(user_id,discount_code_id,provider_order_id,amount_paise) VALUES(?,?,?,?)")
-        .run(session.user_id, discount?.id ?? null, order.id, amountPaise);
+      await db.transaction(async () => {
+        if (discount) {
+          const locked = await db.prepare("SELECT * FROM discount_codes WHERE id=? FOR UPDATE").get(discount.id);
+          const pending = Number((await db.prepare("SELECT COUNT(*) AS total FROM payment_orders WHERE discount_code_id=? AND status='created' AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 minutes'").get(discount.id))?.total || 0);
+          if (!locked || !locked.active || (locked.expires_at && new Date(locked.expires_at).getTime() <= Date.now()) ||
+              Number(locked.percent_off) !== Number(discount.percent_off) ||
+              (locked.max_redemptions != null && Number(locked.redemption_count) + pending >= Number(locked.max_redemptions))) {
+            throw Object.assign(new Error("This discount code is no longer available. No payment was started."), { status: 409 });
+          }
+        }
+        await db.prepare("INSERT INTO payment_orders(user_id,discount_code_id,provider_order_id,amount_paise) VALUES(?,?,?,?)")
+          .run(session.user_id, discount?.id ?? null, order.id, amountPaise);
+      });
       return send(req, res, 200, { ok: true, keyId: process.env.RAZORPAY_KEY_ID, orderId: order.id, amountPaise, currency: "INR", description: "Jazz Recovery annual subscription" }), true;
     }
     if (path.startsWith("/api/admin/discount-codes")) {
