@@ -211,10 +211,19 @@ export async function handleBillingRequest(req, res, path, helpers) {
       const match = path.match(/^\/api\/admin\/discount-codes\/(\d+)$/);
       if (req.method === "PATCH" && match) {
         const body = await readJson(req, 16 * 1024);
-        const active = body.active;
-        if (typeof active !== "boolean") return send(req, res, 400, { ok: false, error: "active must be true or false." }), true;
-        const result = await db.prepare("UPDATE discount_codes SET active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(active, Number(match[1]));
-        if (result.changes) await db.prepare("INSERT INTO recovery_audit(user_id,device_id,action,status) VALUES(?,NULL,?,?)").run(session.user_id, active ? "DISCOUNT_ENABLE" : "DISCOUNT_DISABLE", String(match[1]));
+        const id = Number(match[1]);
+        const current = await db.prepare("SELECT * FROM discount_codes WHERE id=?").get(id);
+        if (!current) return send(req, res, 404, { ok: false, error: "Discount code not found." }), true;
+        const active = body.active === undefined ? current.active : body.active;
+        const percent = body.percentOff === undefined ? Number(current.percent_off) : Number(body.percentOff);
+        const expiresAt = body.expiresAt === undefined ? current.expires_at : (body.expiresAt ? new Date(body.expiresAt) : null);
+        const max = body.maxRedemptions === undefined ? current.max_redemptions : (body.maxRedemptions == null || body.maxRedemptions === "" ? null : Number(body.maxRedemptions));
+        if (typeof active !== "boolean" || !ALLOWED_DISCOUNTS.has(percent)) return send(req, res, 400, { ok: false, error: "Invalid active flag or discount percentage." }), true;
+        if (expiresAt && (!(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()))) return send(req, res, 400, { ok: false, error: "Invalid expiry date." }), true;
+        if (max != null && (!Number.isInteger(max) || max < Number(current.redemption_count) || max > 1000000)) return send(req, res, 400, { ok: false, error: "Redemption limit cannot be below the number already used." }), true;
+        const result = await db.prepare("UPDATE discount_codes SET active=?,percent_off=?,expires_at=?,max_redemptions=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+          .run(active, percent, expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt, max, id);
+        await db.prepare("INSERT INTO recovery_audit(user_id,device_id,action,status) VALUES(?,NULL,'DISCOUNT_EDIT',?)").run(session.user_id, String(id));
         return send(req, res, result.changes ? 200 : 404, { ok: Boolean(result.changes) }), true;
       }
     }
