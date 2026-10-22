@@ -3,6 +3,7 @@
 ## Required private environment variables
 - `JAZZ_DB_ENGINE=postgres` and `DATABASE_URL` for the intended Neon branch.
 - `JAZZ_DISCOUNT_CODE_PEPPER`: long random secret used to HMAC discount codes.
+- `JAZZ_TRIAL_CLAIM_PEPPER`: separate long random secret used to prevent the same normalized username claiming repeated trials without storing usernames in trial history.
 - `JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET`: one-time high-entropy secret used by the first authenticated account to claim billing-admin status.
 - `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`: Razorpay Test Mode credentials first; configure the webhook to send `payment.captured` and `order.paid` events to `/api/billing/razorpay/webhook`.
 
