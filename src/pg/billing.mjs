@@ -18,7 +18,7 @@ function codeIsValid(row, now = Date.now()) {
     (!row.expires_at || new Date(row.expires_at).getTime() > now) &&
     (row.max_redemptions == null || Number(row.redeemed_count) < Number(row.max_redemptions)));
 }
-function discountedPrice(percent) {
+export function discountedPrice(percent) {
   if (![10,20,50,100].includes(Number(percent))) throw new Error("Unsupported discount percentage");
   return Math.round(BASE_PRICE_PAISE * (100 - Number(percent)) / 100);
 }
