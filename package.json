@@ -11,7 +11,8 @@
     "rotate-device": "node src/scripts/dispatch.mjs rotate-device",
     "start:sqlite": "node src/server.mjs",
     "pg:migrate": "node src/pg/migrate.mjs",
-    "pg:import": "node src/scripts/import-sqlite-to-postgres.mjs"
+    "pg:import": "node src/scripts/import-sqlite-to-postgres.mjs",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=22.5.0"
