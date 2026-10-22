@@ -92,9 +92,10 @@ async function grantAnnual(db, { userId, orderId = null, paymentId = null, compl
     if (paymentId && await db.prepare("SELECT user_id FROM subscriptions WHERE last_payment_id=?").get(paymentId)) return;
     if (discount && complimentary) {
       const lockedDiscount = await db.prepare("SELECT * FROM discount_codes WHERE id=? FOR UPDATE").get(discount.id);
+      const pendingReservations = Number((await db.prepare("SELECT COUNT(*) AS total FROM payment_orders WHERE discount_code_id=? AND status='created' AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 minutes'").get(discount.id))?.total || 0);
       if (!lockedDiscount || !lockedDiscount.active ||
           (lockedDiscount.expires_at && new Date(lockedDiscount.expires_at).getTime() <= Date.now()) ||
-          (lockedDiscount.max_redemptions != null && Number(lockedDiscount.redemption_count) >= Number(lockedDiscount.max_redemptions))) {
+          (lockedDiscount.max_redemptions != null && Number(lockedDiscount.redemption_count) + pendingReservations >= Number(lockedDiscount.max_redemptions))) {
         throw Object.assign(new Error("This complimentary code is no longer available."), { status: 409 });
       }
       const alreadyRedeemed = await db.prepare("SELECT id FROM discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id, userId);
@@ -111,7 +112,10 @@ async function grantAnnual(db, { userId, orderId = null, paymentId = null, compl
     if (discount) {
       const redemption = await db.prepare("INSERT INTO discount_redemptions(discount_code_id,user_id,subscription_id,percent_off,amount_paise) VALUES(?,?,?,?,?) ON CONFLICT(discount_code_id,user_id) DO NOTHING")
         .run(discount.id, userId, existing.id, discount.percent_off, amountPaise);
-      if (redemption.changes) await db.prepare("UPDATE discount_codes SET redemption_count=redemption_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(discount.id);
+      if (redemption.changes) {
+        await db.prepare("UPDATE discount_codes SET redemption_count=redemption_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(discount.id);
+        await db.prepare("INSERT INTO recovery_audit(user_id,device_id,action,status) VALUES(?,NULL,'DISCOUNT_REDEEM',?)").run(userId, String(discount.percent_off) + "% / " + String(amountPaise) + " paise");
+      }
     }
     if (orderId) await db.prepare("UPDATE payment_orders SET status='paid',paid_at=CURRENT_TIMESTAMP WHERE provider_order_id=? AND status='created'").run(orderId);
   });
