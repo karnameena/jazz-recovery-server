@@ -76,9 +76,16 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
     const result=await fetch(host+url,{method,headers:{"Content-Type":"application/json",...headers},body:body?JSON.stringify(body):undefined});
     return {status:result.status,response:await result.json(),cookie:result.headers.get("set-cookie")};
   }
+  const anonymousSession=await json("GET","/api/auth/session");
+  assert.equal(anonymousSession.status,200,"A signed-out session check is a normal state, not an API error");
+  assert.equal(anonymousSession.response.authenticated,false);
+
   const session=await json("POST","/api/auth/login",{username:"test-owner",password:ownerPassword});
   assert.equal(session.status,200);
   const cookie=session.cookie.split(";")[0];
+  const authenticatedSession=await json("GET","/api/auth/session",undefined,{Cookie:cookie});
+  assert.equal(authenticatedSession.status,200);
+  assert.equal(authenticatedSession.response.authenticated,true);
   const ownerHeaders={Cookie:cookie};
   async function status(){return await json("GET","/api/devices/"+id,undefined,ownerHeaders);}
   let response=await status();
