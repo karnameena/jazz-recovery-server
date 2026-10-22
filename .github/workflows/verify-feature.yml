@@ -1,9 +1,9 @@
 name: Verify Jazz Recovery server
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feature/recovery-enrollment-neon-20261020]
   push:
-    branches: [feature/recovery-enrollment-neon-20261020]
+    branches: [feature/recovery-enrollment-neon-20261020, feature/fresh-registration-subscriptions-20261022]
 permissions:
   contents: read
 jobs:
@@ -17,4 +17,7 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: node --check src/server.mjs
       - run: node --check src/auth/password.mjs
+      - run: node --check src/entrypoint.mjs
+      - run: node --check src/pg/server.mjs
+      - run: node --check src/pg/billing.mjs
       - run: node --test tests/*.test.mjs
