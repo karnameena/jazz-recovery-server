@@ -485,7 +485,7 @@ const server = http.createServer(async (req, res) => {
           }
           const user = await db.prepare("INSERT INTO users(username,password_hash) VALUES(?,?) RETURNING id")
             .get(username, hashSecret(password));
-          const trialPepper = String(process.env.JAZZ_TRIAL_CLAIM_PEPPER || "");
+          const trialPepper = String(process.env.JAZZ_TRIAL_CLAIM_PEPPER || (isProduction ? "" : "jazz-local-test-trial-claim-pepper"));
           if (!trialPepper) throw new Error("JAZZ_TRIAL_CLAIM_PEPPER must be configured before registration.");
           const usernameHash = crypto.createHmac("sha256", trialPepper).update(username.toLowerCase()).digest("hex");
           const trialClaim = await db.prepare("INSERT INTO billing_trial_claims(username_hash,user_id) VALUES(?,?) ON CONFLICT(username_hash) DO NOTHING RETURNING username_hash")
