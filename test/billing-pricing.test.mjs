@@ -1,15 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { discountedPrice } from "../src/pg/billing.mjs";
 
-// Price rules are intentionally integer-paise math to avoid floating-point billing.
-const price = 49900;
-const discounted = percent => Math.round(price * (100 - percent) / 100);
 test("annual subscription discount amounts are exact in paise", () => {
-  assert.equal(discounted(10), 44910);
-  assert.equal(discounted(20), 39920);
-  assert.equal(discounted(50), 24950);
-  assert.equal(discounted(100), 0);
+  assert.equal(discountedPrice(10), 44910);
+  assert.equal(discountedPrice(20), 39920);
+  assert.equal(discountedPrice(50), 24950);
+  assert.equal(discountedPrice(100), 0);
 });
-test("invalid discounts cannot produce a charge", () => {
-  for (const percent of [0, 1, 30, 101, -10]) assert.equal([10,20,50,100].includes(percent) ? discounted(percent) : null, null);
+
+test("unsupported discounts are rejected", () => {
+  for (const percent of [0, 1, 30, 101, -10, "50"]) {
+    assert.throws(() => discountedPrice(percent));
+  }
 });
