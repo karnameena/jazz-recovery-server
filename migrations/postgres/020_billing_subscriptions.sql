@@ -11,7 +11,7 @@ CREATE INDEX IF NOT EXISTS idx_billing_trials_expires_at ON public.billing_trial
 
 -- Retain the fact that a normalized username already claimed a trial even if the user is later deleted.
 CREATE TABLE IF NOT EXISTS public.billing_trial_claims (
-  username_key TEXT PRIMARY KEY,
+  username_hash TEXT PRIMARY KEY,
   user_id INTEGER REFERENCES public.users(id) ON DELETE SET NULL,
   claimed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
