@@ -21,7 +21,28 @@ async function freePort() {
 }
 test("authenticated Lost Mode heartbeat reports real location toggle status without modifying it", {timeout:45000},async t=>{
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),"jazz-location-readback-"));
-  t.after(()=>fs.rmSync(temporary,{recursive:true,force:true}));
+  let server;
+  t.after(async () => {
+    if (server && server.exitCode === null && server.signalCode === null) {
+      await new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(forceKill);
+          resolve();
+        };
+        const forceKill = setTimeout(() => {
+          if (server.exitCode === null && server.signalCode === null) server.kill("SIGKILL");
+        }, 3000);
+        forceKill.unref();
+        server.once("exit", finish);
+        server.kill("SIGTERM");
+      });
+    }
+    // On Windows, the SQLite file cannot be unlinked until the child process exits.
+    fs.rmSync(temporary,{recursive:true,force:true});
+  });
   const dbfile=path.join(temporary,"lost-mode.db");
   const db=new DatabaseSync(dbfile);
   const schema=fs.readFileSync(path.join(root,"migrations/001_initial.sql"),"utf8");
@@ -36,7 +57,7 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
   db.close();
   const port=await freePort();
   const host="http://127.0.0.1:"+port;
-  const server=spawn(process.execPath,["src/server.mjs"],{
+  server=spawn(process.execPath,["src/server.mjs"],{
     cwd:root,
     env:{...process.env,PORT:String(port),LOST_MODE_DB_PATH:dbfile,LOST_MODE_COOKIE_SECURE:"false",
       LOST_MODE_PUBLIC_ORIGIN:"http://localhost:5190"},
@@ -44,7 +65,6 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
   });
   let stderr="";
   server.stderr.on("data",d=>stderr+=String(d));
-  t.after(()=>server.kill("SIGTERM"));
   let ready=false;
   for(let i=0;i<100;i++){
     if(server.exitCode!==null)break;
@@ -56,9 +76,16 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
     const result=await fetch(host+url,{method,headers:{"Content-Type":"application/json",...headers},body:body?JSON.stringify(body):undefined});
     return {status:result.status,response:await result.json(),cookie:result.headers.get("set-cookie")};
   }
+  const anonymousSession=await json("GET","/api/auth/session");
+  assert.equal(anonymousSession.status,200,"A signed-out session check is a normal state, not an API error");
+  assert.equal(anonymousSession.response.authenticated,false);
+
   const session=await json("POST","/api/auth/login",{username:"test-owner",password:ownerPassword});
   assert.equal(session.status,200);
   const cookie=session.cookie.split(";")[0];
+  const authenticatedSession=await json("GET","/api/auth/session",undefined,{Cookie:cookie});
+  assert.equal(authenticatedSession.status,200);
+  assert.equal(authenticatedSession.response.authenticated,true);
   const ownerHeaders={Cookie:cookie};
   async function status(){return await json("GET","/api/devices/"+id,undefined,ownerHeaders);}
   let response=await status();
@@ -166,4 +193,45 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
   assert.equal(forbiddenAction.status,404,"Another account must not command this device");
   const existing=await json("POST",actions,{action:"RING_DEVICE"},ownerHeaders);
   assert.equal(existing.status,202,"Existing ring device command must still queue");
+  // Registration must work on SQLite as well as PostgreSQL, and must be atomic.
+  const registeredToken=crypto.randomBytes(32).toString("base64url");
+  const registrationBody={
+    username:"new-recovery-owner",
+    password:"RecoveryOwner123!",
+    deviceName:"Recovery Test Phone",
+    imei:"123456789012345",
+    deviceId:"jazz-recovery-test",
+    deviceToken:registeredToken
+  };
+  const registration=await json("POST","/api/auth/register",registrationBody);
+  assert.equal(registration.status,201,"SQLite registration should create an owner and pair its device");
+  assert.equal(registration.response.device.imei,"123456789012345");
+  assert.equal(registration.response.device.deviceId,"jazz-recovery-test");
+  const registrationCookie=registration.cookie.split(";")[0];
+  const registrationSession=await json("GET","/api/auth/session",undefined,{Cookie:registrationCookie});
+  assert.equal(registrationSession.status,200,"Registration should create a usable owner session");
+  const registeredDevice=await json("GET","/api/devices/"+registration.response.device.id,undefined,{Cookie:registrationCookie});
+  assert.equal(registeredDevice.status,200);
+  assert.equal(registeredDevice.response.device.imei,"123456789012345");
+  const registeredHeartbeat=await json("POST","/android/device/heartbeat",{
+    deviceId:"jazz-recovery-test",mode:"NORMAL_MODE",status:{battery:78,network:"WIFI"}
+  },{"Authorization":"Bearer "+registeredToken,"X-Jazz-Lost-Device-Id":"jazz-recovery-test"});
+  assert.equal(registeredHeartbeat.status,200,"New device credential must authenticate");
+
+  const duplicateUsername=await json("POST","/api/auth/register",{
+    ...registrationBody,username:"NEW-RECOVERY-OWNER",deviceId:"another-recovery-device",
+    deviceToken:crypto.randomBytes(32).toString("base64url")
+  });
+  assert.equal(duplicateUsername.status,409,"Username uniqueness must be case-insensitive");
+  const duplicateDevice=await json("POST","/api/auth/register",{
+    ...registrationBody,username:"second-recovery-owner",deviceName:"Second Phone",
+    deviceToken:crypto.randomBytes(32).toString("base64url")
+  });
+  assert.equal(duplicateDevice.status,409,"A device token ID must not be paired twice");
+  const invalidImei=await json("POST","/api/auth/register",{
+    ...registrationBody,username:"invalid-imei-owner",deviceId:"invalid-imei-device",
+    imei:"not-an-imei",deviceToken:crypto.randomBytes(32).toString("base64url")
+  });
+  assert.equal(invalidImei.status,400,"Invalid IMEI must be rejected before writing data");
+
 });

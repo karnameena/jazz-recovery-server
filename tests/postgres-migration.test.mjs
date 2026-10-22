@@ -241,6 +241,36 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     });
     assert.equal(newOwnerLogin.status,200);
 
+    const recoveryToken = crypto.randomBytes(32).toString("base64url");
+    const registration = await api("POST", "/api/auth/register", {
+      username: "recovery-owner",
+      password: "RecoveryOwner123!",
+      deviceName: "Recovery Test Phone",
+      imei: "123456789012345",
+      deviceId: "jazz-recovery-test",
+      deviceToken: recoveryToken
+    });
+    assert.equal(registration.status, 201, "Owner registration should create account and pair device");
+    assert.equal(registration.data.device.imei, "123456789012345");
+    const registeredCookie = { Cookie: registration.cookie.split(";")[0] };
+    const registeredDevices = await api("GET", "/api/devices", null, registeredCookie);
+    assert.equal(registeredDevices.data.items.length, 1);
+    assert.equal(registeredDevices.data.items[0].deviceId, "jazz-recovery-test");
+    assert.equal(registeredDevices.data.items[0].imei, "123456789012345");
+    const registeredHeartbeat = await api("POST", "/android/device/heartbeat", {
+      deviceId: "jazz-recovery-test", mode: "NORMAL_MODE", status: { battery: 78, network: "WIFI" }
+    }, { Authorization: "Bearer " + recoveryToken, "X-Jazz-Lost-Device-Id": "jazz-recovery-test" });
+    assert.equal(registeredHeartbeat.status, 200, "New device token must authenticate after enrollment");
+    const duplicateRegistration = await api("POST", "/api/auth/register", {
+      username: "recovery-owner",
+      password: "RecoveryOwner123!",
+      deviceName: "Another Phone",
+      imei: "123456789012345",
+      deviceId: "jazz-recovery-duplicate",
+      deviceToken: crypto.randomBytes(32).toString("base64url")
+    });
+    assert.equal(duplicateRegistration.status, 409, "Duplicate owner usernames must be rejected");
+
     const changed = await runAdmin("change-owner-password",[
       ["Lost Mode username:", "new-owner"],
       ["New password:", "ReplacedPassword123!"],
