@@ -485,8 +485,12 @@ const server = http.createServer(async (req, res) => {
           }
           const user = await db.prepare("INSERT INTO users(username,password_hash) VALUES(?,?) RETURNING id")
             .get(username, hashSecret(password));
-          await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '7 days') ON CONFLICT(user_id) DO NOTHING")
-            .run(user.id);
+          const trialClaim = await db.prepare("INSERT INTO billing_trial_claims(username_key,user_id) VALUES(LOWER(?),?) ON CONFLICT(username_key) DO NOTHING RETURNING username_key")
+            .get(username, user.id);
+          if (trialClaim) {
+            await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '7 days') ON CONFLICT(user_id) DO NOTHING")
+              .run(user.id);
+          }
           const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
