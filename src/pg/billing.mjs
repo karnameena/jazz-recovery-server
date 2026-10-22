@@ -43,9 +43,12 @@ function makeCode() { return "JAZZ-" + crypto.randomBytes(6).toString("hex").toU
 async function getCode(code, db) {
   return await db.prepare("SELECT * FROM billing_discount_codes WHERE code_hash=?").get(digestCode(code));
 }
-async function redeemCode(db, row, userId, subscriptionId, amount) {
+async function redeemCode(db, row, userId, subscriptionId, amount, { enforceCurrentValidity = true } = {}) {
   const locked = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=? FOR UPDATE").get(row.id);
-  if (!codeIsValid(locked)) throw Object.assign(new Error("This discount code is expired, disabled, or fully redeemed."), { status: 409 });
+  if (!locked || (enforceCurrentValidity && !codeIsValid(locked)) ||
+      (!enforceCurrentValidity && locked.max_redemptions != null && Number(locked.redeemed_count) >= Number(locked.max_redemptions))) {
+    throw Object.assign(new Error("This discount code is no longer available."), { status: 409 });
+  }
   const already = await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(row.id, userId);
   if (already) throw Object.assign(new Error("This account has already used this discount code."), { status: 409 });
   await db.prepare("INSERT INTO billing_discount_redemptions(id,discount_code_id,user_id,subscription_id,amount_paid_paise) VALUES(?,?,?,?,?)")
@@ -95,14 +98,10 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
         const update = await db.prepare("UPDATE billing_payments SET status='paid',payment_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='created' RETURNING id").get(paymentId,row.id);
         if (!update) return;
         let discount = null;
-        if (row.discount_code_id) {
-          discount = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=?").get(row.discount_code_id);
-          await redeemCode(db, discount, row.user_id, "pending", amount);
-        }
         const sub = await grantSubscription(db,row.user_id,amount,row.discount_code_id,paymentId,false);
         if (row.discount_code_id) {
-          await db.prepare("UPDATE billing_discount_redemptions SET subscription_id=? WHERE discount_code_id=? AND user_id=? AND subscription_id='pending'")
-            .run(sub.id,row.discount_code_id,row.user_id);
+          discount = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=?").get(row.discount_code_id);
+          await redeemCode(db, discount, row.user_id, sub.id, amount, { enforceCurrentValidity: false });
         }
         await audit(db,row.user_id,"PAYMENT_CAPTURED",{orderId,paymentId,amount});
       });
