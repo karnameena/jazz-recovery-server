@@ -19,8 +19,8 @@ function codeIsValid(row, now = Date.now()) {
     (row.max_redemptions == null || Number(row.redeemed_count) < Number(row.max_redemptions)));
 }
 export function discountedPrice(percent) {
-  if (![10,20,50,100].includes(Number(percent))) throw new Error("Unsupported discount percentage");
-  return Math.round(BASE_PRICE_PAISE * (100 - Number(percent)) / 100);
+  if (!Number.isInteger(percent) || ![10,20,50,100].includes(percent)) throw new Error("Unsupported discount percentage");
+  return Math.round(BASE_PRICE_PAISE * (100 - percent) / 100);
 }
 function reply(req, res, status, body, json) { json(req, res, status, body); return true; }
 async function sessionFor(req, res, json, requireSession) { return await requireSession(req, res); }
@@ -173,8 +173,28 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       orderResponse = await response.json();
       if (!response.ok || !orderResponse.id) throw new Error("Razorpay order creation failed");
     } catch(error) { return reply(req,res,502,{ok:false,error:"Could not create a payment order. Please retry."},json); }
-    await db.prepare("INSERT INTO billing_payments(id,user_id,order_id,amount_paise,currency,status,discount_code_id) VALUES(?,?,?,?,?,'created',?)")
-      .run(crypto.randomUUID(),userId,orderResponse.id,amount,"INR",discount?.id || null);
+    try {
+      await db.transaction(async () => {
+        if (discount) {
+          const locked = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=? FOR UPDATE").get(discount.id);
+          if (!codeIsValid(locked)) throw Object.assign(new Error("This discount code is no longer available."),{status:409});
+          if (await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId)) {
+            throw Object.assign(new Error("This account has already redeemed this code."),{status:409});
+          }
+          if (await db.prepare("SELECT id FROM billing_payments WHERE discount_code_id=? AND user_id=? AND status='created' LIMIT 1").get(discount.id,userId)) {
+            throw Object.assign(new Error("A checkout for this code is already pending on this account."),{status:409});
+          }
+          const pending = Number((await db.prepare("SELECT COUNT(*) AS total FROM billing_payments WHERE discount_code_id=? AND status='created'").get(discount.id)).total || 0);
+          if (locked.max_redemptions != null && Number(locked.redeemed_count) + pending >= Number(locked.max_redemptions)) {
+            throw Object.assign(new Error("This discount code has reached its redemption limit."),{status:409});
+          }
+        }
+        await db.prepare("INSERT INTO billing_payments(id,user_id,order_id,amount_paise,currency,status,discount_code_id) VALUES(?,?,?,?,?,'created',?)")
+          .run(crypto.randomUUID(),userId,orderResponse.id,amount,"INR",discount?.id || null);
+      });
+    } catch(error) {
+      return reply(req,res,error.status || 500,{ok:false,error:error.message || "Could not save payment order"},json);
+    }
     return reply(req,res,201,{ok:true,keyId,orderId:orderResponse.id,amountPaise:amount,currency:"INR",description:"Jazz Recovery annual subscription"},json);
   }
 
