@@ -10,7 +10,6 @@
     "create-device": "node src/scripts/dispatch.mjs create-device",
     "rotate-device": "node src/scripts/dispatch.mjs rotate-device",
     "pg:migrate": "node src/pg/migrate.mjs",
-    "pg:import": "node src/scripts/import-sqlite-to-postgres.mjs",
     "test": "node --test"
   },
   "engines": {
