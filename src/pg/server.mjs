@@ -202,7 +202,7 @@ async function ownerDevice(userId, id) {
   return await db.prepare("SELECT * FROM devices WHERE id=? AND user_id=?").get(Number(id), userId);
 }
 
-function sqliteUtcToIso(value) {
+function databaseUtcToIso(value) {
   if (!value) return null;
   if (value instanceof Date) return value.toISOString();
   const raw = String(value).trim();
@@ -211,21 +211,21 @@ function sqliteUtcToIso(value) {
   return Number.isNaN(parsed) ? raw : new Date(parsed).toISOString();
 }
 
-function sqliteUtcToMs(value) {
-  const normalized = sqliteUtcToIso(value);
+function databaseUtcToMs(value) {
+  const normalized = databaseUtcToIso(value);
   if (!normalized) return 0;
   const parsed = Date.parse(normalized);
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function sqliteUtcTimestamp(ms) {
+function databaseUtcTimestamp(ms) {
   return new Date(ms).toISOString();
 }
 
 async function stateFor(deviceDbId) {
   const row = await db.prepare("SELECT * FROM device_state WHERE device_id=?").get(deviceDbId);
   if (!row) return null;
-  const lastSeenMs = sqliteUtcToMs(row.last_seen);
+  const lastSeenMs = databaseUtcToMs(row.last_seen);
   return { ...row, online: Boolean(lastSeenMs && Date.now() - lastSeenMs <= ONLINE_WINDOW_MS) };
 }
 
@@ -246,7 +246,7 @@ async function publicDevice(row) {
     battery: state.battery,
     charging: Boolean(state.charging),
     network: state.network || "UNKNOWN",
-    lastSeen: sqliteUtcToIso(state.last_seen),
+    lastSeen: databaseUtcToIso(state.last_seen),
     locationServices: state.online ? locationServicesState(state.location_services_status) : "OFFLINE",
     locationServicesLastConfirmed: state.location_services_timestamp || null,
     location: state.latitude == null ? null : {
@@ -350,7 +350,7 @@ function sameCommandArgs(type, leftJson, rightArgs) {
 // Only Location Services commands expire; all existing recovery TTL behavior
 // stays untouched. A command must never execute after a lost phone reconnects late.
 async function expireLocationCommands(deviceDbId) {
-  const deadline = sqliteUtcTimestamp(Date.now() - LOCATION_COMMAND_TTL_MS);
+  const deadline = databaseUtcTimestamp(Date.now() - LOCATION_COMMAND_TTL_MS);
   const expired = await db.prepare(`SELECT id,type FROM recovery_commands WHERE device_id=? AND status='pending' AND type IN ('location_enable','location_disable','location_status') AND created_at<?`).all(deviceDbId, deadline);
   if (!expired.length) return;
   const update = db.prepare("UPDATE recovery_commands SET status='expired',completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'");
@@ -541,7 +541,7 @@ const server = http.createServer(async (req, res) => {
         return json(req, res, 429, { ok: false, error: "Too many login attempts. Try again later." }, { "Retry-After": "900" });
       }
 
-      const user = await db.prepare("SELECT * FROM users WHERE username=? COLLATE NOCASE").get(username);
+      const user = await db.prepare("SELECT * FROM users WHERE LOWER(username)=LOWER(?)").get(username);
       const validPassword = verifySecret(password, user?.password_hash || dummyPasswordHash);
       if (!user || !validPassword) {
         recordLoginFailure(ip, username);
@@ -591,7 +591,7 @@ const server = http.createServer(async (req, res) => {
       }
       const passwordError = validatePassword(newPassword);
       if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
-      const user = await db.prepare("SELECT id,username,recovery_pin_hash FROM users WHERE username=? COLLATE NOCASE").get(username);
+      const user = await db.prepare("SELECT id,username,recovery_pin_hash FROM users WHERE LOWER(username)=LOWER(?)").get(username);
       const validPin = verifySecret(recoveryPin, user?.recovery_pin_hash || dummyRecoveryPinHash);
       if (!user || !user.recovery_pin_hash || !validPin) {
         recordRecoveryFailure(ip, username);
@@ -626,7 +626,7 @@ const server = http.createServer(async (req, res) => {
         return json(req, res, 429, { ok: false, error: "Too many attempts. Try again later." }, { "Retry-After": "900" });
       }
 
-      const user = await db.prepare("SELECT * FROM users WHERE username=? COLLATE NOCASE").get(username);
+      const user = await db.prepare("SELECT * FROM users WHERE LOWER(username)=LOWER(?)").get(username);
       const validPassword = verifySecret(password, user?.password_hash || dummyPasswordHash);
       if (!user || !validPassword) {
         recordLoginFailure(ip, username);
@@ -736,7 +736,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const user = username && username.length <= 64
-        ? await db.prepare("SELECT id,username FROM users WHERE username=? COLLATE NOCASE").get(username)
+        ? await db.prepare("SELECT id,username FROM users WHERE LOWER(username)=LOWER(?)").get(username)
         : null;
       const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
       const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
@@ -924,8 +924,8 @@ const server = http.createServer(async (req, res) => {
         state?.online ? "PENDING" : "DEVICE_OFFLINE";
       return json(req, res, 200, { ok: true, commandId: command.id, status,
         confirmed, command: command.type, result: outcome,
-        createdAt: sqliteUtcToIso(command.created_at),
-        completedAt: sqliteUtcToIso(command.completed_at) });
+        createdAt: databaseUtcToIso(command.created_at),
+        completedAt: databaseUtcToIso(command.completed_at) });
     }
 
     const auditMatch = path.match(/^\/api\/devices\/(\d+)\/audit$/);
@@ -934,7 +934,7 @@ const server = http.createServer(async (req, res) => {
       const row = await ownerDevice(session.user_id, auditMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       const items = (await db.prepare("SELECT action,status,created_at FROM recovery_audit WHERE user_id=? AND device_id=? ORDER BY id DESC LIMIT 50").all(session.user_id, row.id))
-        .map(item => ({ ...item, created_at: sqliteUtcToIso(item.created_at) }));
+        .map(item => ({ ...item, created_at: databaseUtcToIso(item.created_at) }));
       return json(req, res, 200, { ok: true, items });
     }
 
@@ -955,15 +955,15 @@ const server = http.createServer(async (req, res) => {
         await expireLocationCommands(device.id);
         const next = await db.prepare(`SELECT * FROM recovery_commands WHERE device_id=? AND status='pending' AND (leased_until IS NULL OR leased_until<CURRENT_TIMESTAMP) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`).get(device.id);
         if (!next) return null;
-        const leasedUntil = sqliteUtcTimestamp(Date.now() + 30_000);
+        const leasedUntil = databaseUtcTimestamp(Date.now() + 30_000);
         await db.prepare("UPDATE recovery_commands SET leased_until=? WHERE id=?").run(leasedUntil, next.id);
         return next;
       });
       if (!command) return json(req, res, 200, { ok: true, command: null });
-      const createdAtMs = sqliteUtcToMs(command.created_at);
+      const createdAtMs = databaseUtcToMs(command.created_at);
       return json(req, res, 200, { ok: true, command: {
         id: command.id, type: command.type, args: JSON.parse(command.args_json || "{}"),
-        createdAt: sqliteUtcToIso(command.created_at),
+        createdAt: databaseUtcToIso(command.created_at),
         ...(LOCATION_COMMANDS.has(command.type)
           ? { createdAtMs, expiresAtMs: createdAtMs + LOCATION_COMMAND_TTL_MS }
           : {})
