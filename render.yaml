@@ -1,0 +1,32 @@
+# STAGING ONLY — this branch is NOT deployed automatically.
+# Render Free web services are ephemeral. All persistent state is stored in
+# privately configured Neon PostgreSQL, never in the Render filesystem.
+services:
+  - type: web
+    name: jazz-recovery-server
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: JAZZ_DB_ENGINE
+        value: postgres
+      - key: DATABASE_URL
+        sync: false
+      - key: LOST_MODE_PUBLIC_ORIGINS
+        sync: false
+      - key: LOST_MODE_COOKIE_SECURE
+        value: "true"
+      - key: LOST_MODE_COOKIE_SAMESITE
+        value: None
+      - key: LOST_MODE_TRUST_PROXY
+        value: "true"
+      - key: JAZZ_WEBAUTHN_ORIGIN
+        sync: false
+      - key: JAZZ_WEBAUTHN_RP_ID
+        sync: false

@@ -1,0 +1,25 @@
+# SQLite recovery database contains private owner/device credentials and recovery records.
+# Never upload to GitHub. Use a persistent Render disk or another private data store.
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Generated local state
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
+
+# Local Neon CLI project/org/branch binding (may expose internal metadata)
+.neon
+.neon/
