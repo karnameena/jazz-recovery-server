@@ -1,74 +1,63 @@
-# Jazz Lost Mode — dedicated Render backend
+# Jazz Recovery API — Neon PostgreSQL only
 
-**Source:** copied from the `services/lost-mode-server` module of `karnameena/Jazz-AI-Assistant` at the Jazz icon/location feature branch. This repository contains **only the backend**. The React website lives separately in the main Jazz project (or in a separate website repository).
+This repository contains the Jazz Recovery backend API. The website and Android app call this API over HTTPS. **Neon PostgreSQL is the only supported runtime database.** The website and Android app must never connect directly to Neon or contain database credentials.
 
-## Urgent security warning
+## Architecture
 
-This GitHub repository originally committed database files (`data/*.db`, `*.db-wal`, `*.db-shm`), including a large restored owner/device recovery database. They have been removed **from the tip of `render-backend`**, but **they remain in previous Git history and the original `main` branch**. `.gitignore` does NOT erase that history. Before deploying real recovery accounts:
-1. Make the GitHub repository **private** under Settings → General → Danger Zone.
-2. Remove the files from *all Git history* using a carefully reviewed history cleanup in a local clone (after creating an offline backup); note that old clones and public copies may still exist.
-3. Rotate exposed device credentials and owner passwords and preserve the existing Android Companion pairing as part of a coordinated re-enrollment plan.
-4. Never place SQLite files, credentials, photos, or location/history payloads in GitHub, a public URL, or Render environment variable values.
-
-## Render hosting — `render-backend`
-
-**Recommended: paid Render Web Service with a persistent disk.** This code stores users, device pairing hashes, sessions, command results, photos, and location state in SQLite. Free Render Web Services do not offer permanent local disk persistence and are not suitable for this persistent recovery database.
-
-You can use the included `render.yaml` Render Blueprint (explicitly provisions a **paid Starter** service plus 1 GB disk; review costs before applying), or create a Web Service manually with:
-
-| Render setting | Value |
-|---|---|
-| Repository | `karnameena/jazz-recovery-server` |
-| Branch | `render-backend` |
-| Service type | Web Service |
-| Root directory | repository root, leave blank |
-| Runtime | Node.js 24 |
-| Build | `npm install --omit=dev` |
-| Start | `npm start` (runs `node src/server.mjs`) |
-| Health check | `/health` |
-| Persistent disk mount | `/var/data` |
-| SQLite file | `/var/data/lost-mode.db` |
-
-Set the following environment variables on Render, replacing the website URL with your actual **website origin**, not the backend:
-
-```env
-NODE_ENV=production
-LOST_MODE_DB_PATH=/var/data/lost-mode.db
-LOST_MODE_PUBLIC_ORIGINS=https://YOUR-LOST-MODE-WEBSITE.onrender.com
-LOST_MODE_COOKIE_SECURE=true
-LOST_MODE_COOKIE_SAMESITE=None
-LOST_MODE_TRUST_PROXY=true
+```text
+Jazz Recovery website ─┐
+                       ├── HTTPS ──> Render API ── TLS ──> Neon PostgreSQL
+Jazz Recovery Android ─┘
 ```
 
-Render provides `PORT`; don't hardcode it in the hosted backend. Do not set `NODE_ENV=production` on your local Windows testing environment unless configured accordingly.
+- **Website and Android:** UI only; send authenticated API requests.
+- **Render API:** validates credentials, enforces account/device ownership, issues sessions, manages recovery commands, and writes audit records.
+- **Neon PostgreSQL:** source of truth for users, sessions, paired devices, device state, recovery commands/audit history, and future subscription records.
+- **Migrations:** versioned PostgreSQL SQL files in `migrations/postgres/`; run with `npm run migrate`. The API also applies pending migrations during startup.
+- **Local development:** use a dedicated Neon development/test branch and a private `DATABASE_URL`. Do not use production for development or tests.
 
-## Owner and paired-device database
+## Required server configuration
 
-**Deploying source code does not migrate accounts.** The backend automatically applies SQL migrations on startup, but a new empty disk contains no user or paired device. Login will return `Invalid username or password` even when your credentials match the owner entry in your *local* database.
+Set these variables in Render's private environment settings (never commit values):
 
-Local source known to contain one owner and one paired Android device:
-`<your-original-project>/services/lost-mode-server/data/lost-mode.db`
+| Variable | Required value |
+|---|---|
+| `JAZZ_DB_ENGINE` | `postgres` |
+| `DATABASE_URL` | Neon PostgreSQL connection string for the intended branch |
+| `NODE_ENV` | `production` |
+| `LOST_MODE_PUBLIC_ORIGINS` | Exact HTTPS website origin(s), comma-separated if needed |
+| `LOST_MODE_COOKIE_SECURE` | `true` |
+| `LOST_MODE_COOKIE_SAMESITE` | `None` when website/API are cross-site and cookie configuration requires it |
+| `LOST_MODE_TRUST_PROXY` | `true` on Render |
 
-Do not add this file to the repository. Do not invent a new device credential or reset the phone pairing. For hosted continuity, securely transfer a **consistent SQLite backup** (Node `VACUUM INTO`, with the source database active) from your trusted PC to the Render persistent disk using a private administrator-managed channel, verifying the file and `PRAGMA quick_check` before starting the hosted backend. This step depends on how you administer the Render disk and should be done only after GitHub exposure is remediated and replacement credentials are planned.
+Render provides `PORT`. Use `npm start`; it launches `src/entrypoint.mjs`, which fails closed unless PostgreSQL is explicitly configured and `DATABASE_URL` is present. It does not fall back to a local database.
 
-If an old Render instance already holds owner accounts or pairing records, back it up and decide which dataset is authoritative before any import; **do not overwrite an existing `/var/data/lost-mode.db`**.
-
-## Website integration
-
-This is the `/api` server, not the website build. Host `apps/lost-mode-web` as a Render Static Site separately. Use its `VITE_API_BASE_URL` at build time to point at the HTTPS backend, or configure a same-origin `/api/*` proxy/rewrite on the website. Make sure hosted session cookies work in your chosen deployment; cross-site browser cookie restrictions can break login even when the backend accepts credentials.
-
-The Companion's Lost Mode Server URL must point at the backend HTTPS base URL (not the website URL); the existing device ID and token must match the server database. The dashboard's Location ON/OFF commands additionally require explicit local opt-in and device-owner provisioned Android permissions, not merely installing a new APK.
-
-## Checks
+## Standard commands
 
 ```sh
-npm install --omit=dev
-node --check src/server.mjs
-node --test tests/location-services-readback.test.mjs
+npm install
+npm run check
+npm test
+npm run migrate
 npm start
-# GET http://localhost:8890/health (unless PORT is set)
 ```
 
-When developing locally, use a separate test database and `LOST_MODE_PUBLIC_ORIGINS=http://localhost:5190`. Never commit that database. See Render environment configuration and logs if the website gets 401, 404 or 429 responses.
+Use Node.js 22.5+ (Node 24 is recommended for the hosted service).
 
-The branch is intentionally separate from the source monorepo. The original repository and `main` branch have not been modified by these deployment-branch changes.
+## Data safety and releases
+
+- Never reset, truncate, or replace the production database as part of an application deployment.
+- Never create a new owner or re-pair a device as a workaround for a schema or login error.
+- Back up the intended Neon branch before production schema changes; validate migrations on a separate Neon test branch first.
+- Keep production and test `DATABASE_URL` values separate. Do not print them in logs or paste them into chat.
+- Preserve user IDs, device IDs, credential hashes, device state, recovery commands, and audit history during migrations and repairs.
+- Keep migration SQL additive and backward-compatible where possible; destructive migrations require explicit review and a verified recovery plan.
+- SQLite source files remain only as legacy migration/forensic material. They are not a supported server runtime. The one-time import command is named `npm run import:legacy-sqlite`; do not run it against production without a reviewed mapping, backup, and duplicate-handling plan.
+
+## Security note about historical Git data
+
+Earlier versions of this repository included database files in Git history. Removing them from the latest commit does not remove old Git objects, forks, or clones. Keep the repository private, review historical exposure, and rotate any credentials that may have been exposed through an approved continuity plan. Never commit database files, secrets, photos, location payloads, or exported recovery records.
+
+## Health check
+
+The API health endpoint is `/health`. Confirm health, database connectivity, authentication, website login/session cookies, Android device authentication, recovery commands, and audit writes in the test environment before promoting a release.
