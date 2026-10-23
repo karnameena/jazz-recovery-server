@@ -54,16 +54,15 @@ If your coding agent is Cursor rather than VS Code, replace `vscode` with `curso
 
 ### ChatGPT setup
 
-The VS Code agent's local MCP settings do not automatically connect a ChatGPT conversation. Connect the Neon integration in ChatGPT with your own Neon account authorization if you want this assistant to verify your project and schema directly. Never share a full connection string, API key, password, bearer credential, recovery photo or SQLite file in chat.
+The VS Code agent's local MCP settings do not automatically connect a ChatGPT conversation. Connect the Neon integration in ChatGPT with your own Neon account authorization if you want this assistant to verify your project and schema directly. Never share a full connection string, API key, password, bearer credential, recovery photo or database backup in chat.
 
 ## Connection and data migration, explicitly deferred
 
 Before any real account import, Neon must have a **separate staging branch/database** with no actual production recovery data, and the migration should be tested privately. Do not run `neon env pull`, `neon config apply`, `neon deploy`, or the import script during this CLI/MCP setup.
 
-- The backend already includes an opt-in PostgreSQL engine controlled by `JAZZ_DB_ENGINE=postgres`. It does not activate without a private `DATABASE_URL`.
-- Original SQLite auth and device-pairing code is still the default.
+- The backend requires `JAZZ_DB_ENGINE=postgres` and a private `DATABASE_URL`; there is no alternate database engine or importer.
 - `production` is an existing Neon branch name, not permission to deploy or write into it.
-- Do not import owner hashes, device hashes or recovery histories until the separate go-live authorization is given.
+- Do not reset, recreate, overwrite, or bulk-modify existing owner/device/recovery records as part of code deployment.
 - The `.neon` CLI context and `.env*` secrets are git-ignored on this feature branch.
 - See `docs/postgres-migration-checklist.md` before any future schema creation, migration or Render deployment.
 
