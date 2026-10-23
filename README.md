@@ -8,7 +8,7 @@ Jazz Recovery's hosted API uses **Neon PostgreSQL as its only runtime database**
 - `DATABASE_URL` is required and must be configured privately on the host.
 - Missing or invalid PostgreSQL configuration must stop startup. The API and administration dispatcher must never fall back to SQLite.
 - `npm start` starts `src/entrypoint.mjs`; `npm run migrate` applies PostgreSQL migrations.
-- SQLite is retained only as a **legacy source format for the explicit one-time import utility**. It is not an application runtime database.
+- No SQLite runtime, adapter, migration path, or importer is included. All persistent application data uses PostgreSQL.
 - Runtime migrations are additive. Do not drop schemas, recreate the owner, reset credentials, or import over a populated database.
 
 ## Persistent data
@@ -49,7 +49,7 @@ Recovery PINs are stored as password-style hashes, never plaintext. A 4-digit PI
 
 Deploying source code does **not** move data. Before any production cutover, identify which database currently contains the authoritative owner, paired-device credential hashes, and newest recovery state. Keep the original owner identity, password hash, device IDs, and device credential hashes unchanged. Never paste passwords or `DATABASE_URL` into chat, logs, GitHub, or source files.
 
-The legacy import tool is intentionally separate and must be reviewed against a private, consistent backup first. It refuses to overwrite a populated PostgreSQL destination and requires explicit apply confirmation. Never run its destructive test setup against Neon or any remote database.
+No data importer is included. Keep the existing Neon database and its records in place during code deployment. Any future data movement must be separately designed, explicitly authorized, and tested without resetting the existing database.
 
 ## Local validation
 
@@ -62,7 +62,7 @@ npm install
 node --check src/entrypoint.mjs
 node --check src/pg/server.mjs
 node --test tests/postgres-only-runtime.test.mjs
-node --test tests/location-services-readback.test.mjs
+node --test tests/postgres-only-runtime.test.mjs
 # PostgreSQL integration test requires JAZZ_TEST_DATABASE_URL to point to loopback only.
 node --test tests/postgres-migration.test.mjs
 ```
