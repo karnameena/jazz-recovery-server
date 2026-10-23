@@ -245,6 +245,7 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     const registration = await api("POST", "/api/auth/register", {
       username: "recovery-owner",
       password: "RecoveryOwner123!",
+      confirmPassword: "RecoveryOwner123!",
       deviceName: "Recovery Test Phone",
       imei: "123456789012345",
       deviceId: "jazz-recovery-test",
@@ -266,10 +267,13 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     const duplicateRegistration = await api("POST", "/api/auth/register", {
       username: "recovery-owner",
       password: "RecoveryOwner123!",
+      confirmPassword: "RecoveryOwner123!",
       deviceName: "Another Phone",
       imei: "123456789012345",
       deviceId: "jazz-recovery-duplicate",
-      deviceToken: crypto.randomBytes(32).toString("base64url")
+      deviceToken: crypto.randomBytes(32).toString("base64url"),
+      recoveryPin: "2580",
+      confirmRecoveryPin: "2580"
     });
     assert.equal(duplicateRegistration.status, 409, "Duplicate owner usernames must be rejected");
 
