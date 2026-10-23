@@ -59,12 +59,24 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
   try {
     sqlite.exec(fs.readFileSync(path.join(projectRoot, "migrations/001_initial.sql"), "utf8"));
     sqlite.exec(fs.readFileSync(path.join(projectRoot, "migrations/002_location_service_readback.sql"), "utf8"));
-    const owner = sqlite.prepare("INSERT INTO users(username,password_hash) VALUES(?,?)")
-      .run("existing-owner", hashSecret("ExistingPassword123!"));
+    sqlite.exec("ALTER TABLE users ADD COLUMN recovery_pin_hash TEXT");
+    sqlite.exec(`CREATE TABLE passkey_credentials (
+      credential_id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      public_key TEXT NOT NULL,
+      counter INTEGER NOT NULL DEFAULT 0,
+      transports_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TEXT
+    )`);
+    const owner = sqlite.prepare("INSERT INTO users(username,password_hash,recovery_pin_hash) VALUES(?,?,?)")
+      .run("existing-owner", hashSecret("ExistingPassword123!"), hashSecret("2580"));
     const token = "fixture-" + crypto.randomBytes(24).toString("hex");
     const device = sqlite.prepare("INSERT INTO devices(user_id,device_id,device_name,credential_hash) VALUES(?,?,?,?)")
       .run(Number(owner.lastInsertRowid), "existing-phone", "Original Mobile", hashSecret(token));
     const dbId = Number(device.lastInsertRowid);
+    sqlite.prepare("INSERT INTO passkey_credentials(credential_id,user_id,public_key,counter,transports_json) VALUES(?,?,?,?,?)")
+      .run("fixture-passkey-id", Number(owner.lastInsertRowid), "cHVibGljLWtleQ", 0, "[]");
     sqlite.prepare("INSERT INTO device_state(device_id,photo_data_url,location_services_status) VALUES(?,?,?)")
       .run(dbId, "data:image/jpeg;base64,YWJj", "ON");
     const pending = crypto.randomUUID();
@@ -95,6 +107,17 @@ test("private SQLite import preserves owner/device hashes and recovery API on Po
     assert.equal(rows.rows[0].device_name, "Original Mobile");
     assert.ok(rows.rows[0].credential_hash.startsWith("scrypt$"));
     assert.ok(rows.rows[0].password_hash.startsWith("scrypt$"));
+    const restoredPin = await pool.query("SELECT recovery_pin_hash FROM users WHERE username=$1", ["existing-owner"]);
+    assert.ok(restoredPin.rows[0].recovery_pin_hash.startsWith("scrypt$"), "Recovery PIN hash must be preserved");
+    const restoredPasskey = await pool.query(
+      "SELECT user_id,public_key,counter,transports_json FROM passkey_credentials WHERE credential_id=$1",
+      ["fixture-passkey-id"]
+    );
+    assert.equal(restoredPasskey.rows.length, 1, "Existing passkey credential must be imported");
+    assert.equal(Number(restoredPasskey.rows[0].user_id), Number(owner.lastInsertRowid));
+    assert.equal(restoredPasskey.rows[0].public_key, "cHVibGljLWtleQ");
+    assert.equal(Number(restoredPasskey.rows[0].counter), 0);
+    assert.equal(restoredPasskey.rows[0].transports_json, "[]");
     const expired = await pool.query("SELECT status FROM recovery_commands WHERE id=$1", [pending]);
     assert.equal(expired.rows[0].status, "expired");
     const oldPhoto = await pool.query("SELECT photo_data_url FROM device_state");
