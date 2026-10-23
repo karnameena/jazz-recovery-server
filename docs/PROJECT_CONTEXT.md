@@ -60,7 +60,8 @@ This file is a handoff index for future sessions. It is not a replacement for Gi
 
 - Android draft PR: https://github.com/karnameena/jazz-recovery/pull/16
 - Android feature branch: `feature/neon-device-repair-ui-20261023`
-- Android commit: `e1509d1681e3f1d3d12ebfc38dca8ae9369df996`
+- Android initial commit: `e1509d1681e3f1d3d12ebfc38dca8ae9369df996`
+- Android latest checkpoint commit: `9ecee0ce5536f98aead0cbea380dc1a5d91e228a`
 - Server draft PR #11 remains required: https://github.com/karnameena/jazz-recovery-server/pull/11
 - Confirmed mismatch: the Android app's current `MainActivity.kt` has server URL, health check, manually entered device credential, and heartbeat, but it does not call `POST /api/auth/device-repair` or collect the website account credentials and existing website device ID.
 - The server feature branch contains `POST /api/auth/device-repair`. It verifies the website username/password, finds the existing device by both account ID and device ID, replaces only the device credential hash and optional device metadata in a transaction, and leaves the device ID/history/state/commands/audit records intact.
@@ -70,3 +71,15 @@ This file is a handoff index for future sessions. It is not a replacement for Gi
 - Both PRs are drafts/unmerged. Do not deploy the Android change until the matching server endpoint and migration are deployed to a non-production Neon branch and end-to-end tested. Verify Render's start command is `npm start` (Neon-only `src/entrypoint.mjs`) and its private `JAZZ_DB_ENGINE=postgres` and `DATABASE_URL` point at the intended Neon branch.
 - Test plan: (1) confirm server health and Neon runtime identity; (2) authenticate existing website account; (3) re-pair using exact `devices.device_id` from the website and verify HTTP 200; (4) confirm database device ID, owner, state, commands, and audit history counts are preserved; (5) send Android heartbeat using the newly saved credential; (6) confirm website shows the device online; (7) verify wrong password, wrong owner/device ID, and invalid input fail without credential rotation.
 - Never ask the user to paste passwords, DATABASE_URL, or device tokens into chat/logs. Do not print these secrets in diagnostics.
+
+
+## 2026-10-23 follow-up: re-pair says username/password/device ID not found
+
+- User reports the test re-pair APK's `/health` check succeeds but re-pair says the username/password/device ID is not found.
+- Important: `/health` proves only that some server responds. It does NOT prove that the Neon-only entrypoint is running, that the repair route exists, or that the server uses the same Neon branch/database as the website.
+- Historical context: local `node src/server.mjs` on port 8890 is the legacy SQLite server; previous tests confirmed `POST /api/auth/device-repair` was 404 on that process. Use `npm start` (the Neon-only `src/entrypoint.mjs`) only with a non-production Neon URL while testing.
+- Website dashboard source `src/main.tsx` renders the registered device identifier from `device.deviceId` (the API's `devices.device_id` text value), not the numeric database primary key `device.id`. Re-pair must use that exact displayed string.
+- Android UX bug found and corrected on Android PR #16: the re-pair field was prefilled with the fresh install's temporary ID. It is now blank by default and explicitly warns that the temporary installation ID may differ from the registered website device ID. Latest Android PR commit: `9ecee0ce5536f98aead0cbea380dc1a5d91e228a`.
+- This UX correction alone does not establish that the currently installed APK includes it; a new APK build/install is needed. It also does not solve a server that lacks the route or is pointed at a different database.
+- Safe triage order: (1) inspect Render start command and environment names without printing secrets; (2) POST an empty JSON object to `/api/auth/device-repair` to check route existence without changing credentials (expected route validation 400; missing route commonly 404); (3) use the website API base URL and verify `POST /api/auth/login` plus authenticated `GET /api/devices` see the existing device; (4) compare the exact `device.deviceId` string; (5) only then attempt re-pair on a non-production Neon branch. Never log or share password, `DATABASE_URL`, or device token.
+- If the API returns 401, investigate username/password mismatch or wrong database. If it returns 404 with the server's explicit "That existing device ID is not registered to this account" message, the endpoint authenticated the user but cannot find the exact device ID under that user in the database that API is connected to. If route-level 404/not-found occurs, verify deployed route and Render service/version.
