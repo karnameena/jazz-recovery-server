@@ -8,7 +8,7 @@ await applyMigrations();
 const rl = readline.createInterface({ input, output });
 try {
   const username = (await rl.question("Owner username: ")).trim();
-  const user = await db.prepare("SELECT id,username FROM users WHERE username=? COLLATE NOCASE").get(username);
+  const user = await db.prepare("SELECT id,username FROM users WHERE LOWER(username)=LOWER(?)").get(username);
   if (!user) throw new Error("Owner not found. Run create-owner first.");
 
   const deviceId = (await rl.question("Device ID: ")).trim() || `jazz-lost-${crypto.randomUUID()}`;
