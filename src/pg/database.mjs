@@ -33,11 +33,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const migrationDir = path.resolve(here, "../../migrations/postgres");
 
 // SQL is an internal trusted literal, never user input. All user values are
-// parameterized. SQLite's ? placeholders are translated to PostgreSQL $n.
+// parameterized. Normalize positional placeholders for PostgreSQL.
 function translate(sql) {
-  let text = sql.replace(/username\s*=\s*\?\s+COLLATE\s+NOCASE/gi, "LOWER(username)=LOWER(?)");
   let n = 0;
-  return text.replace(/\?/g, () => "$" + (++n));
+  return sql.replace(/\?/g, () => "$" + (++n));
 }
 
 export const db = {
