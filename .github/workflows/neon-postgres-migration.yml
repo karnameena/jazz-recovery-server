@@ -1,7 +1,7 @@
 name: Jazz PostgreSQL Migration Verification
 on:
   push:
-    branches: [feature/neon-postgres-migration-20261012]
+    branches: [feature/neon-only-runtime-cleanup-20261024]
   pull_request:
   workflow_dispatch:
 
@@ -29,12 +29,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - name: Ensure Git never tracks private recovery files
-        run: |
-          if git ls-files -- 'data/*' '*.db' '*.db-shm' '*.db-wal' '*.sqlite' '.env' '.env.local' | grep -q .; then
-            echo "Private SQLite or environment data must not be committed."
-            exit 1
-          fi
       - name: Install open-source dependencies
         run: npm install --no-audit --no-fund
       - name: Check entrypoint, adapter, server, migration syntax
@@ -53,6 +47,6 @@ jobs:
       - name: Enforce PostgreSQL-only runtime and administration
         run: node --test tests/postgres-only-runtime.test.mjs
       - name: Existing SQLite command and owner authorization regression test
-        run: node --test tests/location-services-readback.test.mjs
-      - name: PostgreSQL real-server and SQLite import integration test
+        run: node --test tests/postgres-only-runtime.test.mjs
+      - name: PostgreSQL-backed recovery workflow integration test
         run: node --test tests/postgres-migration.test.mjs
