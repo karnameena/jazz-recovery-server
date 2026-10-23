@@ -7,7 +7,7 @@
 - Neon PostgreSQL is the only supported application runtime database.
 - `JAZZ_DB_ENGINE` must be `postgres`; `DATABASE_URL` must be configured privately. Missing configuration or any request to use SQLite must fail closed.
 - `src/entrypoint.mjs` is the only supported API entrypoint; the admin dispatcher applies the same PostgreSQL-only rule.
-- SQLite remains only as an explicit one-time legacy import source. No request, session, PIN, passkey, device, photo, location, recovery-command, or audit operation uses SQLite.
+- SQLite code and import tooling are excluded. No request, session, PIN, passkey, device, photo, location, recovery-command, or audit operation uses anything except PostgreSQL.
 - Website and Android clients call the HTTPS API only. They must never receive database credentials.
 - No production database migration, owner recreation, password reset, device-token rotation, or deployment is authorized by this branch.
 
@@ -37,9 +37,8 @@
 3. Make a verified, private backup before any approved data movement. Keep all database files and environment secrets outside GitHub and chat.
 4. Run migrations and account-recovery integration tests only against an isolated test database or staging branch.
 5. Never run `tests/postgres-migration.test.mjs` with a remote `JAZZ_TEST_DATABASE_URL`; its guarded integration setup drops and recreates the local test schema.
-6. Do not run the SQLite importer against production until the source snapshot is verified and the destination's contents have been inspected. The importer must refuse a populated destination rather than overwrite it.
-7. Keep Render's `DATABASE_URL` private, enable TLS, set `JAZZ_DB_ENGINE=postgres`, set the correct public website origin, and align WebAuthn origin/RP ID.
-8. Review Git history for old database artifacts separately; removing files from the latest commit does not erase historic copies.
+6. Keep Render's `DATABASE_URL` private, enable TLS, set `JAZZ_DB_ENGINE=postgres`, set the correct public website origin, and align WebAuthn origin/RP ID.
+7. Review Git history for old database artifacts separately; removing files from the latest commit does not erase historic copies.
 
 ## Verification required before production
 
