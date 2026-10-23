@@ -37,7 +37,7 @@ async function hiddenQuestion(prompt) {
 const rl = readline.createInterface({ input, output });
 try {
   const username = (await rl.question("Lost Mode username: ")).trim();
-  const user = await db.prepare("SELECT id FROM users WHERE username=? COLLATE NOCASE").get(username);
+  const user = await db.prepare("SELECT id FROM users WHERE LOWER(username)=LOWER(?)").get(username);
   if (!user) throw new Error("Owner not found.");
   rl.pause();
 
