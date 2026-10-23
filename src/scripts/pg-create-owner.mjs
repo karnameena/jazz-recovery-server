@@ -38,7 +38,7 @@ const rl = readline.createInterface({ input, output });
 try {
   const username = (await rl.question("Lost Mode username: ")).trim();
   if (!/^[A-Za-z0-9._-]{3,40}$/.test(username)) throw new Error("Username must be 3-40 characters and use letters, numbers, dot, underscore or dash.");
-  if (await db.prepare("SELECT 1 FROM users WHERE username=? COLLATE NOCASE").get(username)) throw new Error("That username already exists.");
+  if (await db.prepare("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)").get(username)) throw new Error("That username already exists.");
   rl.pause();
 
   const password = await hiddenQuestion("Password: ");
