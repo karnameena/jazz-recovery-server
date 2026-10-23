@@ -474,18 +474,20 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req, 32 * 1024);
       const username = String(body.username || "").trim();
       const password = String(body.password || "");
+      const confirmPassword = String(body.confirmPassword || "");
       const deviceName = String(body.deviceName || "").trim();
       const imei = String(body.imei || "").replace(/[\s-]/g, "");
       const deviceId = String(body.deviceId || "").trim();
       const deviceToken = String(body.deviceToken || "").trim();
       const recoveryPin = String(body.recoveryPin || "");
-      const confirmRecoveryPin = String(body.confirmRecoveryPin || recoveryPin);
+      const confirmRecoveryPin = String(body.confirmRecoveryPin || "");
 
       if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) {
         return json(req, res, 400, { ok: false, error: "Username must be 3–64 letters, numbers, dots, underscores or hyphens." });
       }
       const passwordError = validatePassword(password);
       if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      if (password !== confirmPassword) return json(req, res, 400, { ok: false, error: "Passwords do not match." });
       if (!/^\d{4}$/.test(recoveryPin) || recoveryPin !== confirmRecoveryPin) {
         return json(req, res, 400, { ok: false, error: "Enter and confirm the same 4-digit recovery PIN." });
       }
