@@ -13,8 +13,8 @@ function runNode(script, args = [], overrides = {}) {
   });
 }
 
-test("API entrypoint refuses SQLite instead of falling back to a local database", () => {
-  const result = runNode("src/entrypoint.mjs", [], { JAZZ_DB_ENGINE: "sqlite" });
+test("API entrypoint refuses an unsupported database engine instead of falling back", () => {
+  const result = runNode("src/entrypoint.mjs", [], { JAZZ_DB_ENGINE: "unsupported legacy database" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /requires PostgreSQL/i);
 });
@@ -25,8 +25,8 @@ test("API entrypoint defaults to PostgreSQL and requires DATABASE_URL", () => {
   assert.match(result.stderr, /DATABASE_URL is required/i);
 });
 
-test("administrative commands refuse SQLite and require PostgreSQL", () => {
-  const result = runNode("src/scripts/dispatch.mjs", ["create-owner"], { JAZZ_DB_ENGINE: "sqlite" });
+test("administrative commands refuse unsupported legacy database and require PostgreSQL", () => {
+  const result = runNode("src/scripts/dispatch.mjs", ["create-owner"], { JAZZ_DB_ENGINE: "unsupported legacy database" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /administration requires PostgreSQL/i);
 });
