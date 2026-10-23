@@ -55,3 +55,18 @@ This file is a handoff index for future sessions. It is not a replacement for Gi
 4. Confirm the intended Neon branch/environment without printing or sharing connection strings.
 5. Ask for approval before production data changes, production schema operations, merge, or deployment.
 6. Update this continuity file after a meaningful branch/commit/PR milestone with the new verified commit and validation results.
+
+## 2026-10-23 Android re-pair investigation checkpoint
+
+- Android draft PR: https://github.com/karnameena/jazz-recovery/pull/16
+- Android feature branch: `feature/neon-device-repair-ui-20261023`
+- Android commit: `e1509d1681e3f1d3d12ebfc38dca8ae9369df996`
+- Server draft PR #11 remains required: https://github.com/karnameena/jazz-recovery-server/pull/11
+- Confirmed mismatch: the Android app's current `MainActivity.kt` has server URL, health check, manually entered device credential, and heartbeat, but it does not call `POST /api/auth/device-repair` or collect the website account credentials and existing website device ID.
+- The server feature branch contains `POST /api/auth/device-repair`. It verifies the website username/password, finds the existing device by both account ID and device ID, replaces only the device credential hash and optional device metadata in a transaction, and leaves the device ID/history/state/commands/audit records intact.
+- Server branch has PostgreSQL migration `migrations/postgres/002_device_imei.sql` because the existing production schema did not have an `imei` column. The migration must be applied through the reviewed Neon migration flow, never by ad hoc production SQL.
+- Android PR adds a re-pair form, generates a 256-bit URL-safe device token, posts the same API payload, and only after a confirmed successful response saves the token encrypted via Android Keystore and updates the app's local device ID.
+- Server CI checks for commit `2e55ee019ba086eee22ed267c904e227a4e7aae8` reported success (server checks and PostgreSQL migration verification). Android PR has no workflow runs, so Kotlin compilation and physical-device end-to-end testing remain outstanding.
+- Both PRs are drafts/unmerged. Do not deploy the Android change until the matching server endpoint and migration are deployed to a non-production Neon branch and end-to-end tested. Verify Render's start command is `npm start` (Neon-only `src/entrypoint.mjs`) and its private `JAZZ_DB_ENGINE=postgres` and `DATABASE_URL` point at the intended Neon branch.
+- Test plan: (1) confirm server health and Neon runtime identity; (2) authenticate existing website account; (3) re-pair using exact `devices.device_id` from the website and verify HTTP 200; (4) confirm database device ID, owner, state, commands, and audit history counts are preserved; (5) send Android heartbeat using the newly saved credential; (6) confirm website shows the device online; (7) verify wrong password, wrong owner/device ID, and invalid input fail without credential rotation.
+- Never ask the user to paste passwords, DATABASE_URL, or device tokens into chat/logs. Do not print these secrets in diagnostics.
