@@ -26,3 +26,7 @@ services:
         value: None
       - key: LOST_MODE_TRUST_PROXY
         value: "true"
+      - key: JAZZ_WEBAUTHN_ORIGIN
+        sync: false
+      - key: JAZZ_WEBAUTHN_RP_ID
+        sync: false

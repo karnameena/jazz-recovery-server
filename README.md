@@ -1,74 +1,78 @@
-# Jazz Lost Mode — dedicated Render backend
+# Jazz Recovery API — PostgreSQL only
 
-**Source:** copied from the `services/lost-mode-server` module of `karnameena/Jazz-AI-Assistant` at the Jazz icon/location feature branch. This repository contains **only the backend**. The React website lives separately in the main Jazz project (or in a separate website repository).
+Jazz Recovery's hosted API uses **Neon PostgreSQL as its only runtime database**. The website and Android companion call the Node.js API over HTTPS; neither client receives database credentials or connects directly to PostgreSQL.
 
-## Urgent security warning
+## Non-negotiable runtime rules
 
-This GitHub repository originally committed database files (`data/*.db`, `*.db-wal`, `*.db-shm`), including a large restored owner/device recovery database. They have been removed **from the tip of `render-backend`**, but **they remain in previous Git history and the original `main` branch**. `.gitignore` does NOT erase that history. Before deploying real recovery accounts:
-1. Make the GitHub repository **private** under Settings → General → Danger Zone.
-2. Remove the files from *all Git history* using a carefully reviewed history cleanup in a local clone (after creating an offline backup); note that old clones and public copies may still exist.
-3. Rotate exposed device credentials and owner passwords and preserve the existing Android Companion pairing as part of a coordinated re-enrollment plan.
-4. Never place SQLite files, credentials, photos, or location/history payloads in GitHub, a public URL, or Render environment variable values.
+- `JAZZ_DB_ENGINE=postgres` is the only accepted runtime engine.
+- `DATABASE_URL` is required and must be configured privately on the host.
+- Missing or invalid PostgreSQL configuration must stop startup. The API and administration dispatcher must never fall back to SQLite.
+- `npm start` starts `src/entrypoint.mjs`; `npm run migrate` applies PostgreSQL migrations.
+- SQLite is retained only as a **legacy source format for the explicit one-time import utility**. It is not an application runtime database.
+- Runtime migrations are additive. Do not drop schemas, recreate the owner, reset credentials, or import over a populated database.
 
-## Render hosting — `render-backend`
+## Persistent data
 
-**Recommended: paid Render Web Service with a persistent disk.** This code stores users, device pairing hashes, sessions, command results, photos, and location state in SQLite. Free Render Web Services do not offer permanent local disk persistence and are not suitable for this persistent recovery database.
+PostgreSQL stores user accounts and password hashes, recovery PIN hashes, sessions, passkey credentials and one-time WebAuthn challenges, paired devices and credential hashes, IMEI, device state, location and photo data/references, recovery commands, and audit records.
 
-You can use the included `render.yaml` Render Blueprint (explicitly provisions a **paid Starter** service plus 1 GB disk; review costs before applying), or create a Web Service manually with:
+Passkey verification requires the public website origin to match `JAZZ_WEBAUTHN_ORIGIN`; `JAZZ_WEBAUTHN_RP_ID` must be that website's hostname. Keep these values aligned with the HTTPS website users actually open.
 
-| Render setting | Value |
-|---|---|
-| Repository | `karnameena/jazz-recovery-server` |
-| Branch | `render-backend` |
-| Service type | Web Service |
-| Root directory | repository root, leave blank |
-| Runtime | Node.js 24 |
-| Build | `npm install --omit=dev` |
-| Start | `npm start` (runs `node src/server.mjs`) |
-| Health check | `/health` |
-| Persistent disk mount | `/var/data` |
-| SQLite file | `/var/data/lost-mode.db` |
+## Hosted configuration
 
-Set the following environment variables on Render, replacing the website URL with your actual **website origin**, not the backend:
+Set these values in the private Render environment (do not commit secrets):
 
-```env
-NODE_ENV=production
-LOST_MODE_DB_PATH=/var/data/lost-mode.db
-LOST_MODE_PUBLIC_ORIGINS=https://YOUR-LOST-MODE-WEBSITE.onrender.com
-LOST_MODE_COOKIE_SECURE=true
-LOST_MODE_COOKIE_SAMESITE=None
-LOST_MODE_TRUST_PROXY=true
-```
+| Variable | Purpose |
+| --- | --- |
+| `JAZZ_DB_ENGINE` | Must be `postgres` |
+| `DATABASE_URL` | Neon PostgreSQL connection string with TLS |
+| `LOST_MODE_PUBLIC_ORIGINS` | Exact HTTPS website origin allowed to call the API |
+| `LOST_MODE_COOKIE_SECURE` | `true` in production |
+| `LOST_MODE_COOKIE_SAMESITE` | `None` when the frontend and API are cross-site |
+| `LOST_MODE_TRUST_PROXY` | `true` when behind the trusted Render proxy |
+| `JAZZ_WEBAUTHN_ORIGIN` | Exact HTTPS website origin for passkeys |
+| `JAZZ_WEBAUTHN_RP_ID` | Hostname of that website, without scheme or path |
 
-Render provides `PORT`; don't hardcode it in the hosted backend. Do not set `NODE_ENV=production` on your local Windows testing environment unless configured accordingly.
+Render provides `PORT`. The checked-in `render.yaml` is a staging/proposal configuration; do not deploy it to production without reviewing the service settings and explicitly approving the cutover.
 
-## Owner and paired-device database
+## Account recovery endpoints
 
-**Deploying source code does not migrate accounts.** The backend automatically applies SQL migrations on startup, but a new empty disk contains no user or paired device. Login will return `Invalid username or password` even when your credentials match the owner entry in your *local* database.
+- `POST /api/auth/register` — creates a user, stores password/PIN hashes, pairs the submitted Android device, and creates a session in one PostgreSQL transaction.
+- `POST /api/auth/recovery-pin` — authenticated PIN setup/change, requiring the current password.
+- `POST /api/auth/forgot-password` — verifies username + recovery PIN, changes the password, and revokes the user's existing sessions.
+- `POST /api/auth/passkey/register/options` and `/verify` — authenticated passkey enrollment.
+- `POST /api/auth/password-reset/passkey/options` and `/verify` — passkey-based password reset. Compatibility aliases `/api/auth/passkey/options` and `/api/auth/passkey/verify` are also supported.
+- `POST /api/auth/device-repair` — verifies the account password and updates the token on an existing device record without replacing its device state/history.
 
-Local source known to contain one owner and one paired Android device:
-`<your-original-project>/services/lost-mode-server/data/lost-mode.db`
+Recovery PINs are stored as password-style hashes, never plaintext. A 4-digit PIN has limited entropy, so keep rate limits enabled and consider a longer recovery secret in a future UI-compatible change. Passkey challenges expire and are consumed once; passkey credentials and challenge state are stored in PostgreSQL.
 
-Do not add this file to the repository. Do not invent a new device credential or reset the phone pairing. For hosted continuity, securely transfer a **consistent SQLite backup** (Node `VACUUM INTO`, with the source database active) from your trusted PC to the Render persistent disk using a private administrator-managed channel, verifying the file and `PRAGMA quick_check` before starting the hosted backend. This step depends on how you administer the Render disk and should be done only after GitHub exposure is remediated and replacement credentials are planned.
+## Preserving the existing owner and devices
 
-If an old Render instance already holds owner accounts or pairing records, back it up and decide which dataset is authoritative before any import; **do not overwrite an existing `/var/data/lost-mode.db`**.
+Deploying source code does **not** move data. Before any production cutover, identify which database currently contains the authoritative owner, paired-device credential hashes, and newest recovery state. Keep the original owner identity, password hash, device IDs, and device credential hashes unchanged. Never paste passwords or `DATABASE_URL` into chat, logs, GitHub, or source files.
 
-## Website integration
+The legacy import tool is intentionally separate and must be reviewed against a private, consistent backup first. It refuses to overwrite a populated PostgreSQL destination and requires explicit apply confirmation. Never run its destructive test setup against Neon or any remote database.
 
-This is the `/api` server, not the website build. Host `apps/lost-mode-web` as a Render Static Site separately. Use its `VITE_API_BASE_URL` at build time to point at the HTTPS backend, or configure a same-origin `/api/*` proxy/rewrite on the website. Make sure hosted session cookies work in your chosen deployment; cross-site browser cookie restrictions can break login even when the backend accepts credentials.
+## Local validation
 
-The Companion's Lost Mode Server URL must point at the backend HTTPS base URL (not the website URL); the existing device ID and token must match the server database. The dashboard's Location ON/OFF commands additionally require explicit local opt-in and device-owner provisioned Android permissions, not merely installing a new APK.
+Requires Node.js 22.5+ and npm. Use a dedicated, isolated local PostgreSQL test database; never use the live Neon production connection for tests.
 
-## Checks
-
-```sh
-npm install --omit=dev
-node --check src/server.mjs
+```powershell
+$env:JAZZ_DB_ENGINE = "postgres"
+# Set DATABASE_URL privately in your terminal environment.
+npm install
+node --check src/entrypoint.mjs
+node --check src/pg/server.mjs
+node --test tests/postgres-only-runtime.test.mjs
 node --test tests/location-services-readback.test.mjs
-npm start
-# GET http://localhost:8890/health (unless PORT is set)
+# PostgreSQL integration test requires JAZZ_TEST_DATABASE_URL to point to loopback only.
+node --test tests/postgres-migration.test.mjs
 ```
 
-When developing locally, use a separate test database and `LOST_MODE_PUBLIC_ORIGINS=http://localhost:5190`. Never commit that database. See Render environment configuration and logs if the website gets 401, 404 or 429 responses.
+The PostgreSQL integration test deliberately resets the `public` schema only after verifying that `JAZZ_TEST_DATABASE_URL` is a loopback address. **Never point it at Neon or another remote database.**
 
-The branch is intentionally separate from the source monorepo. The original repository and `main` branch have not been modified by these deployment-branch changes.
+## Scale target
+
+The design target is approximately 10,000 registered website users. This is a target, not a performance guarantee: validate Neon plan limits, connection pooling, indexes, API rate limits, storage growth, and concurrent registration/login behavior with load tests before announcing capacity.
+
+## Security note
+
+This repository's older history may contain database artifacts. Removing a file from the current tree does not remove it from Git history. Review repository visibility and history exposure separately, and do not commit database backups, session cookies, tokens, credentials, locations, or recovery photos.

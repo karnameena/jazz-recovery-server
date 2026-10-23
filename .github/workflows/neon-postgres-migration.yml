@@ -49,6 +49,9 @@ jobs:
           node --check src/scripts/pg-create-device.mjs
           node --check src/scripts/pg-change-owner-password.mjs
           node --check src/scripts/pg-rotate-device.mjs
+          node --check tests/postgres-only-runtime.test.mjs
+      - name: Enforce PostgreSQL-only runtime and administration
+        run: node --test tests/postgres-only-runtime.test.mjs
       - name: Existing SQLite command and owner authorization regression test
         run: node --test tests/location-services-readback.test.mjs
       - name: PostgreSQL real-server and SQLite import integration test

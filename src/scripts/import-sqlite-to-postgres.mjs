@@ -13,18 +13,26 @@ if (apply && process.env.JAZZ_CONFIRM_MIGRATION !== "YES") {
 }
 
 const tables = {
-  users: ["id","username","password_hash","created_at","updated_at"],
-  devices: ["id","user_id","device_id","device_name","device_type","credential_hash","created_at","updated_at"],
+  users: ["id","username","password_hash","recovery_pin_hash","created_at","updated_at"],
+  devices: ["id","user_id","device_id","device_name","device_type","credential_hash","imei","created_at","updated_at"],
   device_state: ["device_id","mode","battery","charging","network","online","last_seen",
     "latitude","longitude","accuracy_meters","location_timestamp",
     "photo_data_url","photo_camera","photo_timestamp","updated_at",
     "location_services_status","location_services_timestamp"],
   recovery_commands: ["id","device_id","type","args_json","status","created_at","leased_until","completed_at","result_json"],
-  recovery_audit: ["id","user_id","device_id","action","status","created_at"]
+  recovery_audit: ["id","user_id","device_id","action","status","created_at"],
+  // Passkey public keys are durable credentials. One-time passkey challenges
+  // are deliberately not imported because they must not survive a migration.
+  passkey_credentials: ["credential_id","user_id","public_key","counter","transports_json","created_at","last_used_at"]
 };
-const ordered = Object.keys(tables);
-const temporal = new Set(["created_at","updated_at","last_seen","leased_until","completed_at"]);
 const source = new DatabaseSync(sourceFile, { readOnly: true });
+const sourceTableNames = new Set(source.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name));
+const requiredTables = ["users","devices","device_state","recovery_commands","recovery_audit"];
+for (const table of requiredTables) {
+  if (!sourceTableNames.has(table)) throw new Error("Required table missing from SQLite backup: " + table);
+}
+const ordered = [...requiredTables, ...(sourceTableNames.has("passkey_credentials") ? ["passkey_credentials"] : [])];
+const temporal = new Set(["created_at","updated_at","last_seen","leased_until","completed_at","last_used_at"]);
 
 function parseTimestamp(value) {
   if (value == null || value === "") return null;
@@ -64,7 +72,7 @@ async function run() {
 
     // Require a completely empty destination: no merge, no overwrite, no
     // loss of unrelated existing owners or devices.
-    for (const table of [...ordered, "sessions"]) {
+    for (const table of ["users","sessions","devices","device_state","recovery_commands","recovery_audit","passkey_credentials","passkey_challenges"]) {
       const count = await db.prepare("SELECT COUNT(*) AS n FROM " + table).get();
       if (Number(count.n) !== 0) throw new Error("Destination is not empty (" + table + "); import aborted.");
     }
@@ -100,14 +108,31 @@ async function run() {
       }
     }
 
-    // Compare sensitive hashes privately without displaying any credentials.
+    // Compare sensitive hashes and passkey records privately without displaying credentials.
     for (const row of source.prepare("SELECT id,password_hash FROM users").iterate()) {
       const restored = await db.prepare("SELECT password_hash FROM users WHERE id=?").get(row.id);
       if (restored?.password_hash !== row.password_hash) throw new Error("Owner password hash mismatch");
     }
+    const sourceUserColumns = new Set(source.prepare("PRAGMA table_info(users)").all().map(row => row.name));
+    if (sourceUserColumns.has("recovery_pin_hash")) {
+      for (const row of source.prepare("SELECT id,recovery_pin_hash FROM users").iterate()) {
+        const restored = await db.prepare("SELECT recovery_pin_hash FROM users WHERE id=?").get(row.id);
+        if (restored?.recovery_pin_hash !== row.recovery_pin_hash) throw new Error("Recovery PIN hash mismatch");
+      }
+    }
     for (const row of source.prepare("SELECT device_id,credential_hash FROM devices").iterate()) {
       const restored = await db.prepare("SELECT credential_hash FROM devices WHERE device_id=?").get(row.device_id);
       if (restored?.credential_hash !== row.credential_hash) throw new Error("Device credential hash mismatch");
+    }
+    if (sourceTableNames.has("passkey_credentials")) {
+      for (const row of source.prepare("SELECT credential_id,user_id,public_key,counter,transports_json FROM passkey_credentials").iterate()) {
+        const restored = await db.prepare("SELECT user_id,public_key,counter,transports_json FROM passkey_credentials WHERE credential_id=?").get(row.credential_id);
+        if (!restored || Number(restored.user_id) !== Number(row.user_id) ||
+            restored.public_key !== row.public_key || Number(restored.counter) !== Number(row.counter) ||
+            restored.transports_json !== row.transports_json) {
+          throw new Error("Passkey credential preservation check failed");
+        }
+      }
     }
   });
   } finally { await closeDatabase(); }
