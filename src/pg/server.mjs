@@ -1021,7 +1021,49 @@ const server = http.createServer(async (req, res) => {
       const row = await ownerDevice(session.user_id, photoContentMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
 
-      const state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type FROM device_state WHERE device_id=?").get(row.id);
+      let state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
+      if (!state?.photo_object_key && !state?.photo_data_url) {
+        return json(req, res, 404, { ok: false, error: "No current recovery photo" });
+      }
+
+      // One-time, lazy migration for a legacy current photo stored as a data URL
+      // in PostgreSQL. Upload first; clear the database bytes only after the new
+      // private object is safely committed as the current reference.
+      if (state.photo_data_url && !state.photo_object_key && photoStorageConfigured()) {
+        const legacyDataUrl = state.photo_data_url;
+        try {
+          const legacyMatch = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(legacyDataUrl);
+          if (!legacyMatch) throw new Error("Stored legacy photo is invalid");
+          const legacyPhoto = parsePhotoPayload(legacyMatch[2], legacyMatch[1]);
+          const migrationCommandId = crypto.randomUUID();
+          const migrationKey = currentPhotoKey(row.id, migrationCommandId, legacyPhoto.extension);
+          await uploadPhotoObject({ key: migrationKey, bytes: legacyPhoto.bytes, mimeType: legacyPhoto.mimeType });
+          let committed = false;
+          try {
+            committed = await db.transaction(async () => {
+              await db.lockDevice(row.id);
+              const latest = await db.prepare("SELECT photo_object_key,photo_data_url FROM device_state WHERE device_id=?").get(row.id);
+              if (!latest || latest.photo_object_key || latest.photo_data_url !== legacyDataUrl) return false;
+              await db.prepare("UPDATE device_state SET photo_object_key=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
+                .run(migrationKey, legacyPhoto.mimeType, legacyPhoto.bytes.length, row.id);
+              return true;
+            });
+          } catch (error) {
+            await cleanupUploadedPhotoIfUnreferenced(migrationKey);
+            throw error;
+          }
+          if (!committed) {
+            await cleanupUploadedPhotoIfUnreferenced(migrationKey);
+          }
+          state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
+        } catch (error) {
+          // Migration is opportunistic: retain and serve the legacy current
+          // photo if storage is temporarily unavailable. Never erase it first.
+          console.error("[Jazz Lost Mode] Legacy photo migration deferred:", error?.name || "error");
+          state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
+        }
+      }
+
       if (!state?.photo_object_key && !state?.photo_data_url) {
         return json(req, res, 404, { ok: false, error: "No current recovery photo" });
       }
@@ -1029,13 +1071,7 @@ const server = http.createServer(async (req, res) => {
       let bytes;
       let mimeType;
       try {
-        if (state.photo_data_url) {
-          const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(state.photo_data_url);
-          if (!match) throw new Error("Stored legacy photo is invalid");
-          const parsed = parsePhotoPayload(match[2], match[1]);
-          bytes = parsed.bytes;
-          mimeType = parsed.mimeType;
-        } else {
+        if (state.photo_object_key) {
           const object = await getPhotoObject(state.photo_object_key);
           if (!object?.Body) throw new Error("Current photo object is empty");
           const rawBytes = await object.Body.transformToByteArray();
@@ -1044,6 +1080,12 @@ const server = http.createServer(async (req, res) => {
           const declaredMime = state.photo_mime_type || object.ContentType ||
             (state.photo_object_key.endsWith(".png") ? "image/png" : "image/jpeg");
           const parsed = parsePhotoPayload(candidate.toString("base64"), declaredMime);
+          bytes = parsed.bytes;
+          mimeType = parsed.mimeType;
+        } else {
+          const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(state.photo_data_url);
+          if (!match) throw new Error("Stored legacy photo is invalid");
+          const parsed = parsePhotoPayload(match[2], match[1]);
           bytes = parsed.bytes;
           mimeType = parsed.mimeType;
         }
