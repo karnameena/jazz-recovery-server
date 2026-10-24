@@ -7,6 +7,7 @@ function normalizePlan(value) {
   return plan;
 }
 export function planExpiry(startMs, plan) {
+  plan = normalizePlan(plan);
   const start = new Date(startMs);
   const target = new Date(startMs);
   const day = start.getUTCDate();
