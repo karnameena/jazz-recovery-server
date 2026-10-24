@@ -1,64 +1,71 @@
-# Jazz Recovery billing integration (feature branch)
+# Jazz Recovery subscription and Razorpay setup
 
-## Required private environment variables
-- `JAZZ_DB_ENGINE=postgres` and `DATABASE_URL` for the intended Neon branch.
-- `JAZZ_DISCOUNT_CODE_PEPPER`: long random secret used to HMAC discount codes.
-- `JAZZ_TRIAL_CLAIM_PEPPER`: separate long random secret used to prevent the same normalized username claiming repeated trials without storing usernames in trial history.
-- `JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET`: one-time high-entropy secret used by the first authenticated account to claim billing-admin status.
-- `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`: Razorpay Test Mode credentials first; configure the webhook to send `payment.captured` and `order.paid` events to `/api/billing/razorpay/webhook`.
+This guide applies to the isolated subscription feature branch. It does not authorize a production reset, merge, or deployment.
 
-Never put these values in the website bundle, Git, screenshots, or chat.
+## Plans and rules
 
-## Safety notes
-- The registration endpoint creates a one-time seven-day trial.
-- Annual list price is ₹499 (49900 paise). Discounts are 10%, 20%, 50%, and 100%; the server calculates amounts.
-- Only a verified Razorpay webhook grants paid subscriptions. Browser callbacks are not payment proof.
-- 100% discounts grant a complimentary annual subscription without creating a Razorpay order.
-- Code rotation changes future code validation only; already granted subscriptions remain intact.
-- The first admin must authenticate normally and submit the one-time bootstrap secret. After claiming, remove the bootstrap secret from the environment.
-- Do not reset production until the migration and registration path have been tested on a separate Neon branch and a new owner account/bootstrap process has been confirmed.
+- Monthly: ₹49 (4900 paise), one calendar month.
+- Annual: ₹399 (39900 paise), twelve calendar months.
+- A new eligible username receives one seven-day trial. Trial claims are retained as a username HMAC in PostgreSQL so deleting/recreating an account does not automatically grant another trial.
+- Discount codes apply to the annual plan only. The server computes every amount in integer paise.
+- `jazzry10` is seeded as an active 10% annual discount when `JAZZ_DISCOUNT_CODE_PEPPER` is configured.
+- `jazzfamly` is seeded as a disabled 100% complimentary annual code. In the owner controls, set a maximum redemption count and save it before enabling the code. This prevents an accidental unlimited free-access code.
+- A 100% code grants a complimentary entitlement without pretending a Razorpay payment occurred.
+- Active subscriptions cannot be checked out again until current access expires. Each account can have one pending checkout; retrying the same plan/code resumes its existing Razorpay order.
+- Only a captured payment confirmed by a valid Razorpay webhook can activate paid access. Browser callbacks, screenshots, and payment-success pages are not payment proof.
+- Recovery data and billing data use PostgreSQL. The hosted entry point fails closed unless `JAZZ_DB_ENGINE=postgres` and `DATABASE_URL` are configured.
 
+## Required private Render environment variables
 
-## Production fresh reset (owner/admin will also be deleted)
+- `JAZZ_DB_ENGINE=postgres`
+- `DATABASE_URL` — Neon PostgreSQL connection string for the intended environment.
+- `JAZZ_DISCOUNT_CODE_PEPPER` — long random secret used to HMAC discount codes.
+- `JAZZ_TRIAL_CLAIM_PEPPER` — a different long random secret used to HMAC trial claims.
+- `JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET` — one-time high-entropy secret used by the first authenticated owner account to claim billing-admin controls.
+- `RAZORPAY_KEY_ID` — use the Test Mode key while KYC is pending.
+- `RAZORPAY_KEY_SECRET` — private server-side Test Mode secret.
+- `RAZORPAY_WEBHOOK_SECRET` — a separate secret configured for the Razorpay webhook endpoint.
+- Existing server origin/cookie settings required by the current deployment, including `LOST_MODE_PUBLIC_ORIGINS`.
 
-**Status: NOT EXECUTED.** Do not run this until the matching website/server feature branches are approved, staging registration and recovery checks pass, Razorpay Test Mode webhook verification succeeds, and the production cutover is scheduled.
+Generate high-entropy secrets locally with a trusted password manager or PowerShell cryptographic randomness. Never commit them, place them in Vite variables, paste them into screenshots, or share them in chat. The Razorpay key secret and webhook secret must never be exposed to the browser.
 
-A separate Neon branch copy was created from the production branch and verified:
-- Backup branch: `pre-reset-production-verified-20261022`
-- Branch ID: `br-long-cell-b4cie19y`
-- At backup time: 1 user, 1 device, 1 session, 177 recovery commands, and 465 recovery audit rows.
-- The native snapshot request was rejected because the project's snapshot quota was full. The branch copy is the available recoverable backup; keep it and do not delete it.
-- Migration verification branch: `billing-feature-test-20261022` (`br-broad-paper-b4mv3x1t`). The billing migration was applied there; all billing tables were created and the original user/device/recovery row counts remained unchanged.
+## Razorpay configuration
 
-### Approved reset scope
-The requested reset removes the existing owner/admin account as well as every registered user, paired device, browser session, queued recovery command, recovery state, recovery audit record, billing admin, discount code/redemption, trial claim, subscription, payment record, and webhook event. It must **not** drop schemas or tables. The Neon Auth schema is not part of this reset.
+1. Complete the merchant KYC/business verification requested by Razorpay. Until approved, keep the site in Test Mode.
+2. Configure the server with Test Mode credentials only.
+3. In Razorpay, add a webhook pointing to `https://YOUR-API-HOST/api/billing/razorpay/webhook`.
+4. Set the webhook secret in `RAZORPAY_WEBHOOK_SECRET`.
+5. Enable `payment.captured` and `order.paid` events. The backend verifies the HMAC signature over the raw request body and checks the payment order, INR currency, exact amount, and pending billing record. Webhook event IDs are stored to make retries idempotent.
+6. Use Razorpay's test payment methods to verify successful, failed, dismissed, duplicate, and delayed webhook scenarios before requesting live credentials.
+7. Once KYC is approved, configure the live Key ID, Key Secret, and webhook secret privately on the server and verify the live webhook. Never mix Test Mode and Live Mode credentials.
 
-### Cutover sequence
-1. Create and verify a second Neon branch backup immediately before the reset; preserve both backup branches.
-2. Pause the deployed API to prevent concurrent writes. Confirm the deployed server's `DATABASE_URL` points to the intended production branch.
-3. Apply the new migration from this feature branch and verify the new schema exists.
-4. In one transaction, delete rows in this order (only after the backup is verified):
-   ```sql
-   BEGIN;
-   DELETE FROM public.billing_webhook_events;
-   DELETE FROM public.billing_discount_redemptions;
-   DELETE FROM public.billing_payments;
-   DELETE FROM public.billing_subscriptions;
-   DELETE FROM public.billing_trials;
-   DELETE FROM public.billing_trial_claims;
-   DELETE FROM public.billing_discount_codes;
-   DELETE FROM public.billing_admins;
-   DELETE FROM public.billing_audit;
-   DELETE FROM public.recovery_commands;
-   DELETE FROM public.device_state;
-   DELETE FROM public.devices;
-   DELETE FROM public.sessions;
-   DELETE FROM public.recovery_audit;
-   DELETE FROM public.users;
-   COMMIT;
-   ```
-5. Deploy the tested website and server pair, then register the new owner account through the website. Generate/copy the device ID and secret into the installed Android app.
-6. Claim billing-admin access once using `JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET`; remove that secret from Render after the claim succeeds.
-7. Confirm a new 7-day trial, login/logout, Android heartbeat, command polling/results, recovery actions, discount management, and Razorpay Test Mode webhook activation before accepting real payments.
+## First owner setup and discounts
 
-Do not perform the reset before step 1–3 are complete. If any verification fails, stop and restore the app/database connection to the verified backup rather than continuing.
+1. Register/sign in using the intended owner account; do not delete or reset existing accounts as part of billing setup.
+2. Configure the one-time `JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET`, sign in as the owner, and use the existing billing admin claim flow once. Remove the bootstrap secret from Render after successful claim.
+3. The server seeds `jazzry10` and `jazzfamly` on PostgreSQL when `JAZZ_DISCOUNT_CODE_PEPPER` is configured. The seed is insert-only; it does not overwrite owner changes.
+4. In Owner Controls, set a maximum redemption limit for `jazzfamly`, save it, then enable it. Keep it disabled until its limit is set.
+5. Confirm `jazzry10` previews 10% off ₹399 (₹359.10) and `jazzfamly` previews ₹0 only after it is enabled.
+
+## Test checklist
+
+- Registration creates one seven-day trial and paired device in the same PostgreSQL-backed flow.
+- Login, logout, and re-login do not reset trial timestamps.
+- Trial expiry is calculated from server timestamps.
+- Monthly checkout creates a ₹49 order and grants one calendar month after verified capture.
+- Annual checkout creates a ₹399 order and grants twelve calendar months after verified capture.
+- Annual discounts calculate correctly: 10% → ₹359.10; 20% → ₹319.20; 50% → ₹199.50; 100% → ₹0 complimentary entitlement.
+- Monthly checkout rejects annual-only discount codes.
+- Invalid webhook signatures, mismatched amounts/currency/orders, and unverified browser callbacks never activate access.
+- Duplicate webhook delivery never grants a second subscription.
+- Concurrent checkout attempts cannot create multiple pending orders for the same account.
+- Existing owner login, device pairing, device heartbeat, location, recovery photo, commands, and audit records remain intact.
+- Verify the website production build and server tests before any deployment.
+
+## Deployment safety
+
+- This branch is not a production release.
+- Do not run any user/device reset SQL, drop schemas, change the production Neon branch, merge these branches, or deploy without explicit owner approval.
+- Apply the additive `021_billing_plan_types.sql` migration only through the reviewed PostgreSQL migration runner on the intended environment.
+- Take and verify a fresh database backup before any production migration.
+- KYC pending means live payment acceptance is not ready. The website can be built and tested in Test Mode, but do not advertise live checkout until Razorpay enables it.
