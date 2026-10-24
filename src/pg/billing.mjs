@@ -174,6 +174,8 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
     const body = await jsonBody(req,readJson);
     let plan;
     try { plan = normalizePlan(body.plan || "annual"); } catch (error) { return reply(req,res,error.status || 400,{ok:false,error:error.message},json); }
+    const activeSubscription = await db.prepare("SELECT id FROM billing_subscriptions WHERE user_id=? AND status IN ('active','complimentary') AND expires_at>CURRENT_TIMESTAMP LIMIT 1").get(userId);
+    if (activeSubscription) return reply(req,res,409,{ok:false,error:"Your subscription is already active. You can subscribe again after the current access period ends."},json);
     let discount = null;
     if (plan === "monthly" && String(body.code || "").trim()) return reply(req,res,400,{ok:false,error:"Discount codes apply to the annual plan only."},json);
     if (String(body.code || "").trim()) {
@@ -204,6 +206,14 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
     const keyId = String(process.env.RAZORPAY_KEY_ID || "");
     const keySecret = String(process.env.RAZORPAY_KEY_SECRET || "");
     if (!keyId || !keySecret) return reply(req,res,503,{ok:false,error:"Razorpay is not configured yet"},json);
+    const pending = await db.prepare("SELECT order_id,amount_paise,discount_code_id,plan_type FROM billing_payments WHERE user_id=? AND status='created' LIMIT 1").get(userId);
+    if (pending) {
+      const sameDiscount = String(pending.discount_code_id || "") === String(discount?.id || "");
+      if (pending.plan_type === plan && Number(pending.amount_paise) === amount && sameDiscount) {
+        return reply(req,res,200,{ok:true,keyId,orderId:pending.order_id,amountPaise:amount,currency:"INR",plan,description:plan === "monthly" ? "Jazz Recovery monthly subscription" : "Jazz Recovery annual subscription",resumed:true},json);
+      }
+      return reply(req,res,409,{ok:false,error:"You already have a pending checkout. Complete that payment first, or retry it with the same plan and discount code."},json);
+    }
     const orderReceipt = "jz_" + crypto.randomBytes(12).toString("hex");
     let orderResponse;
     try {
@@ -231,7 +241,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
           .run(crypto.randomUUID(),userId,orderResponse.id,amount,"INR",discount?.id || null,plan);
       });
     } catch(error) {
-      return reply(req,res,error.status || 500,{ok:false,error:error.message || "Could not save payment order"},json);
+      return reply(req,res,error?.code === "23505" ? 409 : (error.status || 500),{ok:false,error:error?.code === "23505" ? "A checkout is already pending for this account." : (error.message || "Could not save payment order")},json);
     }
     return reply(req,res,201,{ok:true,keyId,orderId:orderResponse.id,amountPaise:amount,currency:"INR",plan,description:plan === "monthly" ? "Jazz Recovery monthly subscription" : "Jazz Recovery annual subscription"},json);
   }
