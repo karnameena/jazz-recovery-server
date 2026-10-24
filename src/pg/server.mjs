@@ -4,7 +4,7 @@ import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
-import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured } from "./photos.mjs";
+import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured } from "./photos.mjs";
 
 await applyMigrations();
 
@@ -1013,6 +1013,53 @@ const server = http.createServer(async (req, res) => {
       const row = await ownerDevice(session.user_id, deviceMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       return json(req, res, 200, { ok: true, device: await publicDevice(row) });
+    }
+
+    const photoContentMatch = path.match(/^\\/api\\/devices\\/(\\d+)\\/photo-content$/);
+    if (req.method === "GET" && photoContentMatch) {
+      const session = await requireSession(req, res); if (!session) return;
+      const row = await ownerDevice(session.user_id, photoContentMatch[1]);
+      if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
+
+      const state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type FROM device_state WHERE device_id=?").get(row.id);
+      if (!state?.photo_object_key && !state?.photo_data_url) {
+        return json(req, res, 404, { ok: false, error: "No current recovery photo" });
+      }
+
+      let bytes;
+      let mimeType;
+      try {
+        if (state.photo_data_url) {
+          const match = /^data:(image\\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(state.photo_data_url);
+          if (!match) throw new Error("Stored legacy photo is invalid");
+          const parsed = parsePhotoPayload(match[2], match[1]);
+          bytes = parsed.bytes;
+          mimeType = parsed.mimeType;
+        } else {
+          const object = await getPhotoObject(state.photo_object_key);
+          if (!object?.Body) throw new Error("Current photo object is empty");
+          const rawBytes = await object.Body.transformToByteArray();
+          const candidate = Buffer.from(rawBytes);
+          if (!candidate.length || candidate.length > 5 * 1024 * 1024) throw new Error("Current photo size is invalid");
+          const declaredMime = state.photo_mime_type || object.ContentType ||
+            (state.photo_object_key.endsWith(".png") ? "image/png" : "image/jpeg");
+          const parsed = parsePhotoPayload(candidate.toString("base64"), declaredMime);
+          bytes = parsed.bytes;
+          mimeType = parsed.mimeType;
+        }
+      } catch (error) {
+        console.error("[Jazz Lost Mode] Current photo read/validation failed:", error?.name || "error");
+        return json(req, res, 502, { ok: false, error: "The current photo could not be read or is not a valid JPEG/PNG. Capture a new photo and try again." });
+      }
+
+      applySecurityHeaders(req, res);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("Content-Length", String(bytes.length));
+      res.setHeader("Content-Disposition", `${url.searchParams.get("download") === "1" ? "attachment" : "inline"}; filename="jazz-recovery-current.${mimeType === "image/png" ? "png" : "jpg"}"`);
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.end(bytes);
+      return;
     }
 
     const photoUrlMatch = path.match(/^\/api\/devices\/(\d+)\/photo-url$/);
