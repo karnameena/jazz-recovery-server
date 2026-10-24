@@ -319,7 +319,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       const expires = body.expiresAt === undefined ? existing.expires_at : (body.expiresAt ? new Date(body.expiresAt) : null);
       if (expires && Number.isNaN(new Date(expires).getTime())) return reply(req,res,400,{ok:false,error:"Invalid expiry date."},json);
       const max = body.maxRedemptions === undefined ? existing.max_redemptions : (body.maxRedemptions === "" || body.maxRedemptions == null ? null : Number(body.maxRedemptions));
-      if (max != null && (!Number.isInteger(max) || max < Number(existing.redeemed_count))) return reply(req,res,400,{ok:false,error:"Redemption limit cannot be below existing redemptions."},json);
+      if (max != null && (!Number.isInteger(max) || max < 1 || max < Number(existing.redeemed_count))) return reply(req,res,400,{ok:false,error:"Redemption limit must be positive and cannot be below existing redemptions."},json);
       await db.prepare("UPDATE billing_discount_codes SET percent_off=?,expires_at=?,max_redemptions=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(percent,expires ? new Date(expires).toISOString() : null,max,id);
       await audit(db,userId,"DISCOUNT_UPDATED",{id,percentOff:percent});
       return reply(req,res,200,{ok:true},json);
