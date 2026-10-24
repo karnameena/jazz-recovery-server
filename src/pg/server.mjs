@@ -1,11 +1,12 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { applyMigrations, db } from "./database.mjs";
-import { handleBillingRoute } from "./billing.mjs";
+import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
 
 await applyMigrations();
+await ensureDefaultDiscountCodes(db);
 
 const port = Number(process.env.PORT || 8890);
 const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production" || String(process.env.RENDER || "").toLowerCase() === "true";
