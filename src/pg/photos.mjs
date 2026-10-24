@@ -16,8 +16,14 @@ export function parsePhotoPayload(imageBase64, declaredMimeType) {
       bytes.toString("base64") !== imageBase64) {
     throw new Error("Recovery photo encoding is invalid or exceeds the 5 MB limit.");
   }
-  const jpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
-  const png = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+  const jpeg = bytes.length >= 5 &&
+    bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff &&
+    bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9;
+  const pngSignature = Buffer.from([137,80,78,71,13,10,26,10]);
+  const pngEnd = Buffer.from([0,0,0,0,73,69,78,68,174,66,96,130]);
+  const png = bytes.length >= 20 &&
+    bytes.subarray(0, 8).equals(pngSignature) &&
+    bytes.subarray(bytes.length - 12).equals(pngEnd);
   const mimeType = jpeg ? "image/jpeg" : png ? "image/png" : null;
   if (!mimeType || declaredMimeType !== mimeType) {
     throw new Error("Recovery photo must be a valid JPEG or PNG matching its declared content type.");
@@ -61,7 +67,9 @@ export function currentPhotoKey(deviceId, commandId, extension) {
       !["jpg", "png"].includes(extension)) {
     throw new Error("Invalid recovery photo object identity.");
   }
-  return `devices/${Number(deviceId)}/${commandId}.${extension}`;
+  // A unique key per upload attempt prevents concurrent retries for the same
+  // command from overwriting bytes that another request may be committing.
+  return `devices/${Number(deviceId)}/${commandId}/${crypto.randomUUID()}.${extension}`;
 }
 
 export async function uploadPhotoObject({ key, bytes, mimeType }) {
