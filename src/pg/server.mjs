@@ -462,8 +462,10 @@ async function cleanupUploadedPhotoIfUnreferenced(key) {
   try {
     referenced = await db.prepare("SELECT 1 FROM device_state WHERE photo_object_key=? LIMIT 1").get(key);
   } catch {
-    // A failed query cannot prove the object is unused. Prefer a possible
-    // temporary orphan to deleting a photo that may already be current.
+    // A failed query cannot prove the object is unused. Queue it for a retry;
+    // the worker rechecks references before every deletion.
+    await db.prepare("INSERT INTO photo_cleanup_jobs(object_key) VALUES(?) ON CONFLICT(object_key) DO NOTHING")
+      .run(key).catch(() => {});
     return;
   }
   if (referenced) return;
