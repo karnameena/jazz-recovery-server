@@ -255,6 +255,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
     if (!bootstrap || !safeEqual(supplied,bootstrap)) return reply(req,res,403,{ok:false,error:"Invalid admin bootstrap secret"},json);
     try {
       await db.transaction(async () => {
+        await db.prepare("SELECT pg_advisory_xact_lock(7482362)").get();
         const count = Number((await db.prepare("SELECT COUNT(*) AS total FROM billing_admins").get()).total);
         if (count) throw Object.assign(new Error("An admin is already configured"),{status:409});
         await db.prepare("INSERT INTO billing_admins(user_id) VALUES(?) ON CONFLICT DO NOTHING").run(userId);
