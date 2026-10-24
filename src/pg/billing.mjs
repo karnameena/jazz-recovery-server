@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-const PLAN_PRICES_PAISE = Object.freeze({ monthly: 4900, annual: 39900 });
+export const PLAN_PRICES_PAISE = Object.freeze({ monthly: 4900, annual: 39900 });
 function normalizePlan(value) {
   const plan = String(value || "annual").toLowerCase();
   if (!Object.hasOwn(PLAN_PRICES_PAISE, plan)) throw Object.assign(new Error("Choose a valid subscription plan."), { status: 400 });
