@@ -1,7 +1,22 @@
 import crypto from "node:crypto";
 
-const BASE_PRICE_PAISE = 49900;
-const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
+const PLAN_PRICES_PAISE = Object.freeze({ monthly: 4900, annual: 39900 });
+function normalizePlan(value) {
+  const plan = String(value || "annual").toLowerCase();
+  if (!Object.hasOwn(PLAN_PRICES_PAISE, plan)) throw Object.assign(new Error("Choose a valid subscription plan."), { status: 400 });
+  return plan;
+}
+function planExpiry(startMs, plan) {
+  const start = new Date(startMs);
+  const target = new Date(startMs);
+  const day = start.getUTCDate();
+  target.setUTCDate(1);
+  if (plan === "monthly") target.setUTCMonth(target.getUTCMonth() + 1);
+  else target.setUTCFullYear(target.getUTCFullYear() + 1);
+  const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(day, lastDay));
+  return target;
+}
 
 function digestCode(code) {
   const pepper = String(process.env.JAZZ_DISCOUNT_CODE_PEPPER || "");
@@ -18,9 +33,10 @@ function codeIsValid(row, now = Date.now()) {
     (!row.expires_at || new Date(row.expires_at).getTime() > now) &&
     (row.max_redemptions == null || Number(row.redeemed_count) < Number(row.max_redemptions)));
 }
-export function discountedPrice(percent) {
+export function discountedPrice(percent, plan = "annual") {
   if (!Number.isInteger(percent) || ![10,20,50,100].includes(percent)) throw new Error("Unsupported discount percentage");
-  return Math.round(BASE_PRICE_PAISE * (100 - percent) / 100);
+  if (normalizePlan(plan) !== "annual") throw new Error("Discount codes are available for the annual plan only");
+  return Math.round(PLAN_PRICES_PAISE.annual * (100 - percent) / 100);
 }
 function reply(req, res, status, body, json) { json(req, res, status, body); return true; }
 async function sessionFor(req, res, json, requireSession) { return await requireSession(req, res); }
@@ -55,15 +71,15 @@ async function redeemCode(db, row, userId, subscriptionId, amount, { enforceCurr
     .run(crypto.randomUUID(), row.id, userId, subscriptionId, amount);
   await db.prepare("UPDATE billing_discount_codes SET redeemed_count=redeemed_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(row.id);
 }
-async function grantSubscription(db, userId, amount, discountId, paymentId, complimentary = false) {
+async function grantSubscription(db, userId, amount, discountId, paymentId, plan = "annual", complimentary = false) {
   const current = await db.prepare("SELECT expires_at FROM billing_subscriptions WHERE user_id=? AND status IN ('active','complimentary') AND expires_at>CURRENT_TIMESTAMP ORDER BY expires_at DESC LIMIT 1").get(userId);
   const now = Date.now();
   const starts = current ? Math.max(now, new Date(current.expires_at).getTime()) : now;
   const subscriptionId = crypto.randomUUID();
   const status = complimentary ? "complimentary" : "active";
-  const expires = new Date(starts + YEAR_MS).toISOString();
-  await db.prepare("INSERT INTO billing_subscriptions(id,user_id,status,starts_at,expires_at,amount_paid_paise,discount_code_id,payment_id) VALUES(?,?,?,?,?,?,?,?)")
-    .run(subscriptionId, userId, status, new Date(starts).toISOString(), expires, amount, discountId, paymentId);
+  const expires = planExpiry(starts, plan).toISOString();
+  await db.prepare("INSERT INTO billing_subscriptions(id,user_id,status,starts_at,expires_at,amount_paid_paise,discount_code_id,payment_id,plan_type) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run(subscriptionId, userId, status, new Date(starts).toISOString(), expires, amount, discountId, paymentId, plan);
   return { id: subscriptionId, status, expiresAt: expires };
 }
 async function jsonBody(req, readJson) { return await readJson(req, 64 * 1024); }
@@ -98,7 +114,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
         const update = await db.prepare("UPDATE billing_payments SET status='paid',payment_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='created' RETURNING id").get(paymentId,row.id);
         if (!update) return;
         let discount = null;
-        const sub = await grantSubscription(db,row.user_id,amount,row.discount_code_id,paymentId,false);
+        const sub = await grantSubscription(db,row.user_id,amount,row.discount_code_id,paymentId,row.plan_type || "annual",false);
         if (row.discount_code_id) {
           discount = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=?").get(row.discount_code_id);
           await redeemCode(db, discount, row.user_id, sub.id, amount, { enforceCurrentValidity: false });
@@ -118,33 +134,39 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
 
   if (req.method === "GET" && path === "/api/billing/status") {
     const trial = await db.prepare("SELECT starts_at,expires_at FROM billing_trials WHERE user_id=?").get(userId);
-    const subscription = await db.prepare("SELECT status,starts_at,expires_at,amount_paid_paise FROM billing_subscriptions WHERE user_id=? AND status IN ('active','complimentary') ORDER BY expires_at DESC LIMIT 1").get(userId);
+    const subscription = await db.prepare("SELECT status,starts_at,expires_at,amount_paid_paise,plan_type FROM billing_subscriptions WHERE user_id=? AND status IN ('active','complimentary') ORDER BY expires_at DESC LIMIT 1").get(userId);
     const now = Date.now();
     const paid = Boolean(subscription && new Date(subscription.expires_at).getTime() > now);
     const trialing = Boolean(trial && new Date(trial.starts_at).getTime() <= now && new Date(trial.expires_at).getTime() > now);
-    return reply(req,res,200,{ok:true,pricePaise:BASE_PRICE_PAISE,trial:trial ? {startsAt:trial.starts_at,expiresAt:trial.expires_at} : null,subscription:subscription ? {...subscription,active:paid} : null,access:paid ? "subscribed" : trialing ? "trial" : "expired",canUsePaidFeatures:paid || trialing},json);
+    return reply(req,res,200,{ok:true,pricePaise:PLAN_PRICES_PAISE.annual,plans:PLAN_PRICES_PAISE,trial:trial ? {startsAt:trial.starts_at,expiresAt:trial.expires_at,active:trialing} : null,subscription:subscription ? {...subscription,active:paid} : null,access:paid ? "subscribed" : trialing ? "trial" : "expired",canUsePaidFeatures:paid || trialing},json);
   }
 
   if (req.method === "POST" && path === "/api/billing/discount/validate") {
     const body = await jsonBody(req,readJson);
+    let plan;
+    try { plan = normalizePlan(body.plan || "annual"); } catch (error) { return reply(req,res,error.status || 400,{ok:false,error:error.message},json); }
+    if (plan !== "annual") return reply(req,res,200,{ok:true,valid:false,error:"Discount codes apply to the annual plan only."},json);
     let row;
     try { row = await getCode(body.code,db); } catch (error) { return reply(req,res,error.status || 503,{ok:false,error:error.message},json); }
     if (!codeIsValid(row)) return reply(req,res,200,{ok:true,valid:false,error:"This discount code is invalid, expired, disabled, or fully redeemed."},json);
     const used = await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(row.id,userId);
     if (used) return reply(req,res,200,{ok:true,valid:false,error:"This account has already redeemed this code."},json);
-    return reply(req,res,200,{ok:true,valid:true,percentOff:Number(row.percent_off),amountPaise:discountedPrice(row.percent_off),label:row.label},json);
+    return reply(req,res,200,{ok:true,valid:true,percentOff:Number(row.percent_off),amountPaise:discountedPrice(row.percent_off,plan),label:row.label,plan},json);
   }
 
   if (req.method === "POST" && path === "/api/billing/checkout") {
     const body = await jsonBody(req,readJson);
+    let plan;
+    try { plan = normalizePlan(body.plan || "annual"); } catch (error) { return reply(req,res,error.status || 400,{ok:false,error:error.message},json); }
     let discount = null;
+    if (plan === "monthly" && String(body.code || "").trim()) return reply(req,res,400,{ok:false,error:"Discount codes apply to the annual plan only."},json);
     if (String(body.code || "").trim()) {
       try { discount = await getCode(body.code,db); } catch (error) { return reply(req,res,error.status || 503,{ok:false,error:error.message},json); }
       if (!codeIsValid(discount)) return reply(req,res,409,{ok:false,error:"This discount code is invalid, expired, disabled, or fully redeemed."},json);
       if (await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId)) return reply(req,res,409,{ok:false,error:"This account has already redeemed this code."},json);
     }
     const percent = Number(discount?.percent_off || 0);
-    const amount = discount ? discountedPrice(percent) : BASE_PRICE_PAISE;
+    const amount = discount ? discountedPrice(percent,plan) : PLAN_PRICES_PAISE[plan];
     if (amount === 0) {
       try {
         const sub = await db.transaction(async () => {
@@ -154,7 +176,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
             const existing = await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId);
             if (existing) throw Object.assign(new Error("This account has already redeemed this code."),{status:409});
           }
-          const result = await grantSubscription(db,userId,0,discount?.id || null,null,true);
+          const result = await grantSubscription(db,userId,0,discount?.id || null,null,plan,true);
           if (discount) await redeemCode(db,discount,userId,result.id,0);
           await audit(db,userId,"COMPLIMENTARY_SUBSCRIPTION",{subscriptionId:result.id,discountId:discount?.id || null});
           return result;
@@ -189,13 +211,13 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
             throw Object.assign(new Error("This discount code has reached its redemption limit."),{status:409});
           }
         }
-        await db.prepare("INSERT INTO billing_payments(id,user_id,order_id,amount_paise,currency,status,discount_code_id) VALUES(?,?,?,?,?,'created',?)")
-          .run(crypto.randomUUID(),userId,orderResponse.id,amount,"INR",discount?.id || null);
+        await db.prepare("INSERT INTO billing_payments(id,user_id,order_id,amount_paise,currency,status,discount_code_id,plan_type) VALUES(?,?,?,?,?,'created',?,?)")
+          .run(crypto.randomUUID(),userId,orderResponse.id,amount,"INR",discount?.id || null,plan);
       });
     } catch(error) {
       return reply(req,res,error.status || 500,{ok:false,error:error.message || "Could not save payment order"},json);
     }
-    return reply(req,res,201,{ok:true,keyId,orderId:orderResponse.id,amountPaise:amount,currency:"INR",description:"Jazz Recovery annual subscription"},json);
+    return reply(req,res,201,{ok:true,keyId,orderId:orderResponse.id,amountPaise:amount,currency:"INR",plan,description:plan === "monthly" ? "Jazz Recovery monthly subscription" : "Jazz Recovery annual subscription"},json);
   }
 
   if (req.method === "POST" && path === "/api/billing/admin/claim") {
