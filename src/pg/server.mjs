@@ -4,7 +4,7 @@ import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
-import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured } from "./photos.mjs";
+import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
 
 await applyMigrations();
 
@@ -235,6 +235,7 @@ function locationServicesState(value) {
 }
 
 async function migrateLegacyPhotoToObjectStorage(deviceId, legacyState) {
+  if (!shouldMigrateLegacyPhoto(legacyState, legacyState.photo_data_url)) return false;
   const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(legacyState.photo_data_url || ""));
   if (!match) return false;
   const parsed = parsePhotoPayload(match[2], match[1]);
@@ -245,12 +246,9 @@ async function migrateLegacyPhotoToObjectStorage(deviceId, legacyState) {
     await db.transaction(async () => {
       await db.lockDevice(deviceId);
       const current = await db.prepare("SELECT photo_data_url,photo_object_key FROM device_state WHERE device_id=?").get(deviceId);
-      if (!current || current.photo_data_url !== legacyState.photo_data_url) return;
+      if (!shouldMigrateLegacyPhoto(current, legacyState.photo_data_url)) return;
       await db.prepare("UPDATE device_state SET photo_object_key=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
         .run(key, parsed.mimeType, parsed.bytes.length, deviceId);
-      if (current.photo_object_key && current.photo_object_key !== key) {
-        await db.prepare("INSERT INTO photo_cleanup_jobs(object_key) VALUES(?) ON CONFLICT(object_key) DO NOTHING").run(current.photo_object_key);
-      }
       committed = true;
     });
   } catch (error) {
@@ -263,7 +261,7 @@ async function migrateLegacyPhotoToObjectStorage(deviceId, legacyState) {
 
 async function publicDevice(row) {
   let state = (await stateFor(row.id)) || {};
-  if (state.photo_data_url && photoStorageConfigured()) {
+  if (shouldMigrateLegacyPhoto(state, state.photo_data_url) && photoStorageConfigured()) {
     try {
       await migrateLegacyPhotoToObjectStorage(row.id, state);
       state = (await stateFor(row.id)) || state;
@@ -1029,7 +1027,7 @@ const server = http.createServer(async (req, res) => {
       // One-time, lazy migration for a legacy current photo stored as a data URL
       // in PostgreSQL. Upload first; clear the database bytes only after the new
       // private object is safely committed as the current reference.
-      if (state.photo_data_url && !state.photo_object_key && photoStorageConfigured()) {
+      if (shouldMigrateLegacyPhoto(state, state.photo_data_url) && photoStorageConfigured()) {
         const legacyDataUrl = state.photo_data_url;
         try {
           const legacyMatch = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(legacyDataUrl);
