@@ -1,11 +1,12 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { applyMigrations, db } from "./database.mjs";
-import { handleBillingRoute } from "./billing.mjs";
+import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
 
 await applyMigrations();
+await ensureDefaultDiscountCodes(db);
 
 const port = Number(process.env.PORT || 8890);
 const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production" || String(process.env.RENDER || "").toLowerCase() === "true";
@@ -498,13 +499,14 @@ const server = http.createServer(async (req, res) => {
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
           await audit(user.id, device.id, "DEVICE_REGISTER", "SUCCESS");
-          return { userId: user.id, deviceId: device.id };
+          return { userId: user.id, deviceId: device.id, trialActivated: Boolean(trialClaim) };
         });
         if (registered.conflict) return json(req, res, 409, { ok: false, error: registered.conflict });
         const session = await createSession(registered.userId);
         return json(req, res, 201, {
           ok: true,
           username,
+          trialActivated: registered.trialActivated,
           device: { id: registered.deviceId, deviceId, deviceName, imei, deviceType: "Android" },
           expiresAt: session.expires
         }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
