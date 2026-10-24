@@ -1,7 +1,7 @@
 name: Jazz PostgreSQL Migration Verification
 on:
   push:
-    branches: [feature/neon-only-runtime-cleanup-20261024]
+    branches: [feature/neon-only-runtime-cleanup-20261024, feature/single-current-photo-atomic-20261024]
   pull_request:
   workflow_dispatch:
 
@@ -36,6 +36,8 @@ jobs:
           node --check src/entrypoint.mjs
           node --check src/pg/database.mjs
           node --check src/pg/server.mjs
+          node --check src/pg/photos.mjs
+          node --check tests/photo-storage.test.mjs
           node --check src/pg/sessions.mjs
           node --check src/scripts/dispatch.mjs
           node --check src/scripts/pg-create-owner.mjs
@@ -44,6 +46,6 @@ jobs:
           node --check src/scripts/pg-rotate-device.mjs
           node --check tests/postgres-only-runtime.test.mjs
       - name: Enforce PostgreSQL-only runtime and administration
-        run: node --test tests/postgres-only-runtime.test.mjs
+        run: node --test tests/postgres-only-runtime.test.mjs tests/photo-storage.test.mjs
       - name: PostgreSQL-backed recovery workflow integration test
         run: node --test tests/postgres-migration.test.mjs
