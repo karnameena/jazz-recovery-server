@@ -437,6 +437,13 @@ async function processPhotoCleanupJobs() {
   const jobs = await db.prepare("SELECT object_key,attempts FROM photo_cleanup_jobs WHERE next_attempt_at<=CURRENT_TIMESTAMP ORDER BY created_at LIMIT 20").all();
   for (const job of jobs) {
     try {
+      // Never delete an object while any device still points at it. This also
+      // protects against an ambiguous database COMMIT result during recovery.
+      const activeReference = await db.prepare("SELECT 1 FROM device_state WHERE photo_object_key=? LIMIT 1").get(job.object_key);
+      if (activeReference) {
+        await db.prepare("DELETE FROM photo_cleanup_jobs WHERE object_key=?").run(job.object_key);
+        continue;
+      }
       await deletePhotoObject(job.object_key);
       await db.prepare("DELETE FROM photo_cleanup_jobs WHERE object_key=?").run(job.object_key);
     } catch (error) {
@@ -451,7 +458,14 @@ async function processPhotoCleanupJobs() {
 
 async function cleanupUploadedPhotoIfUnreferenced(key) {
   if (!key) return;
-  const referenced = await db.prepare("SELECT 1 FROM device_state WHERE photo_object_key=? LIMIT 1").get(key).catch(() => null);
+  let referenced;
+  try {
+    referenced = await db.prepare("SELECT 1 FROM device_state WHERE photo_object_key=? LIMIT 1").get(key);
+  } catch {
+    // A failed query cannot prove the object is unused. Prefer a possible
+    // temporary orphan to deleting a photo that may already be current.
+    return;
+  }
   if (referenced) return;
   try {
     await deletePhotoObject(key);
