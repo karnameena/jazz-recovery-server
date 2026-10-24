@@ -234,8 +234,45 @@ function locationServicesState(value) {
   return value === "ON" || value === "OFF" ? value : "UNKNOWN";
 }
 
+async function migrateLegacyPhotoToObjectStorage(deviceId, legacyState) {
+  const match = /^data:(image\\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(legacyState.photo_data_url || ""));
+  if (!match) return false;
+  const parsed = parsePhotoPayload(match[2], match[1]);
+  const key = currentPhotoKey(deviceId, crypto.randomUUID(), parsed.extension);
+  await uploadPhotoObject({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
+  let committed = false;
+  try {
+    await db.transaction(async () => {
+      await db.lockDevice(deviceId);
+      const current = await db.prepare("SELECT photo_data_url,photo_object_key FROM device_state WHERE device_id=?").get(deviceId);
+      if (!current || current.photo_data_url !== legacyState.photo_data_url) return;
+      await db.prepare("UPDATE device_state SET photo_object_key=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
+        .run(key, parsed.mimeType, parsed.bytes.length, deviceId);
+      if (current.photo_object_key && current.photo_object_key !== key) {
+        await db.prepare("INSERT INTO photo_cleanup_jobs(object_key) VALUES(?) ON CONFLICT(object_key) DO NOTHING").run(current.photo_object_key);
+      }
+      committed = true;
+    });
+  } catch (error) {
+    await cleanupUploadedPhotoIfUnreferenced(key);
+    throw error;
+  }
+  if (!committed) await cleanupUploadedPhotoIfUnreferenced(key);
+  return committed;
+}
+
 async function publicDevice(row) {
-  const state = (await stateFor(row.id)) || {};
+  let state = (await stateFor(row.id)) || {};
+  if (state.photo_data_url && photoStorageConfigured()) {
+    try {
+      await migrateLegacyPhotoToObjectStorage(row.id, state);
+      state = (await stateFor(row.id)) || state;
+    } catch (error) {
+      // Keep the legacy current photo intact and visible if migration cannot
+      // complete. It will be retried on a later authenticated dashboard read.
+      console.error("[Jazz Lost Mode] Legacy photo migration deferred:", error?.name || "error");
+    }
+  }
   return {
     id: row.id,
     deviceId: row.device_id,
