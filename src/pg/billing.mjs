@@ -34,10 +34,13 @@ function codeIsValid(row, now = Date.now()) {
     (!row.expires_at || new Date(row.expires_at).getTime() > now) &&
     (row.max_redemptions == null || Number(row.redeemed_count) < Number(row.max_redemptions)));
 }
+function codeEligibleForPlan(row, plan) {
+  return Boolean(row && ["both", plan].includes(String(row.eligible_plan || "annual")));
+}
 export function discountedPrice(percent, plan = "annual") {
   if (!Number.isInteger(percent) || ![10,20,50,100].includes(percent)) throw new Error("Unsupported discount percentage");
   if (normalizePlan(plan) !== "annual") throw new Error("Discount codes are available for the annual plan only");
-  return Math.round(PLAN_PRICES_PAISE.annual * (100 - percent) / 100);
+  return Math.round(PLAN_PRICES_PAISE[normalizePlan(plan)] * (100 - percent) / 100);
 }
 function reply(req, res, status, body, json) { json(req, res, status, body); return true; }
 async function sessionFor(req, res, json, requireSession) { return await requireSession(req, res); }
@@ -82,8 +85,8 @@ async function redeemCode(db, row, userId, subscriptionId, amount, { enforceCurr
       (!enforceCurrentValidity && locked.max_redemptions != null && Number(locked.redeemed_count) >= Number(locked.max_redemptions))) {
     throw Object.assign(new Error("This discount code is no longer available."), { status: 409 });
   }
-  const already = await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(row.id, userId);
-  if (already) throw Object.assign(new Error("This account has already used this discount code."), { status: 409 });
+  const used = await db.prepare("SELECT COUNT(*) AS total FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(row.id, userId);
+  if (Number(used?.total || 0) >= Number(locked.per_user_limit || 1)) throw Object.assign(new Error("This account has reached this discount code's per-user redemption limit."), { status: 409 });
   await db.prepare("INSERT INTO billing_discount_redemptions(id,discount_code_id,user_id,subscription_id,amount_paid_paise) VALUES(?,?,?,?,?)")
     .run(crypto.randomUUID(), row.id, userId, subscriptionId, amount);
   await db.prepare("UPDATE billing_discount_codes SET redeemed_count=redeemed_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(row.id);
@@ -162,12 +165,11 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
     const body = await jsonBody(req,readJson);
     let plan;
     try { plan = normalizePlan(body.plan || "annual"); } catch (error) { return reply(req,res,error.status || 400,{ok:false,error:error.message},json); }
-    if (plan !== "annual") return reply(req,res,200,{ok:true,valid:false,error:"Discount codes apply to the annual plan only."},json);
     let row;
     try { row = await getCode(body.code,db); } catch (error) { return reply(req,res,error.status || 503,{ok:false,error:error.message},json); }
-    if (!codeIsValid(row)) return reply(req,res,200,{ok:true,valid:false,error:"This discount code is invalid, expired, disabled, or fully redeemed."},json);
-    const used = await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(row.id,userId);
-    if (used) return reply(req,res,200,{ok:true,valid:false,error:"This account has already redeemed this code."},json);
+    if (!codeIsValid(row) || !codeEligibleForPlan(row,plan)) return reply(req,res,200,{ok:true,valid:false,error:"This discount code is invalid, unavailable, or not eligible for the selected plan."},json);
+    const used = await db.prepare("SELECT COUNT(*) AS total FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(row.id,userId);
+    if (Number(used?.total || 0) >= Number(row.per_user_limit || 1)) return reply(req,res,200,{ok:true,valid:false,error:"This account has reached this discount code's per-user redemption limit."},json);
     return reply(req,res,200,{ok:true,valid:true,percentOff:Number(row.percent_off),amountPaise:discountedPrice(row.percent_off,plan),label:row.label,plan},json);
   }
 
@@ -181,8 +183,9 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
     if (plan === "monthly" && String(body.code || "").trim()) return reply(req,res,400,{ok:false,error:"Discount codes apply to the annual plan only."},json);
     if (String(body.code || "").trim()) {
       try { discount = await getCode(body.code,db); } catch (error) { return reply(req,res,error.status || 503,{ok:false,error:error.message},json); }
-      if (!codeIsValid(discount)) return reply(req,res,409,{ok:false,error:"This discount code is invalid, expired, disabled, or fully redeemed."},json);
-      if (await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId)) return reply(req,res,409,{ok:false,error:"This account has already redeemed this code."},json);
+      if (!codeIsValid(discount) || !codeEligibleForPlan(discount,plan)) return reply(req,res,409,{ok:false,error:"This discount code is invalid, unavailable, or not eligible for the selected plan."},json);
+      const used = await db.prepare("SELECT COUNT(*) AS total FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId);
+      if (Number(used?.total || 0) >= Number(discount.per_user_limit || 1)) return reply(req,res,409,{ok:false,error:"This account has reached this discount code's per-user redemption limit."},json);
     }
     const percent = Number(discount?.percent_off || 0);
     const amount = discount ? discountedPrice(percent,plan) : PLAN_PRICES_PAISE[plan];
@@ -192,8 +195,8 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
           if (discount) {
             const locked = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=? FOR UPDATE").get(discount.id);
             if (!codeIsValid(locked)) throw Object.assign(new Error("This discount code is no longer available."),{status:409});
-            const existing = await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId);
-            if (existing) throw Object.assign(new Error("This account has already redeemed this code."),{status:409});
+            const used = await db.prepare("SELECT COUNT(*) AS total FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId);
+            if (Number(used?.total || 0) >= Number(locked.per_user_limit || 1)) throw Object.assign(new Error("This account has reached this discount code's per-user redemption limit."),{status:409});
           }
           const result = await grantSubscription(db,userId,0,discount?.id || null,null,plan,true);
           if (discount) await redeemCode(db,discount,userId,result.id,0);
@@ -265,7 +268,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
   if (path.startsWith("/api/billing/admin/")) {
     if (!(await adminCheck(userId,db))) return reply(req,res,403,{ok:false,error:"Owner/admin access required"},json);
     if (req.method === "GET" && path === "/api/billing/admin/discount-codes") {
-      const rows = await db.prepare("SELECT id,label,percent_off,active,starts_at,expires_at,max_redemptions,redeemed_count,created_at,updated_at FROM billing_discount_codes ORDER BY created_at DESC").all();
+      const rows = await db.prepare("SELECT id,label,percent_off,active,starts_at,expires_at,max_redemptions,redeemed_count,eligible_plan,per_user_limit,created_at,updated_at FROM billing_discount_codes ORDER BY created_at DESC").all();
       return reply(req,res,200,{ok:true,items:rows},json);
     }
     if (req.method === "POST" && path === "/api/billing/admin/discount-codes") {
@@ -277,12 +280,17 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       const label = String(body.label || (percent+"% discount")).trim().slice(0,100);
       const max = body.maxRedemptions == null || body.maxRedemptions === "" ? null : Number(body.maxRedemptions);
       if (max != null && (!Number.isInteger(max) || max < 1 || max > 1000000)) return reply(req,res,400,{ok:false,error:"Redemption limit must be a positive whole number."},json);
+      const starts = body.startsAt ? new Date(body.startsAt) : new Date();
       const expires = body.expiresAt ? new Date(body.expiresAt) : null;
-      if (expires && Number.isNaN(expires.getTime())) return reply(req,res,400,{ok:false,error:"Invalid expiry date."},json);
+      const eligiblePlan = String(body.eligiblePlan || "annual");
+      const perUserLimit = body.perUserLimit == null || body.perUserLimit === "" ? 1 : Number(body.perUserLimit);
+      if (Number.isNaN(starts.getTime()) || (expires && Number.isNaN(expires.getTime())) || (expires && expires <= starts)) return reply(req,res,400,{ok:false,error:"Invalid discount start/end date range."},json);
+      if (!["annual","monthly","both"].includes(eligiblePlan)) return reply(req,res,400,{ok:false,error:"Eligible plan must be annual, monthly or both."},json);
+      if (!Number.isInteger(perUserLimit) || perUserLimit < 1 || perUserLimit > 1000000) return reply(req,res,400,{ok:false,error:"Per-user redemption limit must be a positive whole number."},json);
       try {
         const id = crypto.randomUUID();
-        await db.prepare("INSERT INTO billing_discount_codes(id,code_hash,label,percent_off,expires_at,max_redemptions,created_by) VALUES(?,?,?,?,?,?,?)")
-          .run(id,digestCode(code),label,percent,expires ? expires.toISOString() : null,max,userId);
+        await db.prepare("INSERT INTO billing_discount_codes(id,code_hash,label,percent_off,starts_at,expires_at,max_redemptions,eligible_plan,per_user_limit,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)")
+          .run(id,digestCode(code),label,percent,starts.toISOString(),expires ? expires.toISOString() : null,max,eligiblePlan,perUserLimit,userId);
         await audit(db,userId,"DISCOUNT_CREATED",{id,label,percentOff:percent});
         return reply(req,res,201,{ok:true,id,code,label,percentOff:percent,expiresAt:expires?.toISOString() || null,maxRedemptions:max},json);
       } catch(error) {
@@ -316,11 +324,16 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       const body = await jsonBody(req,readJson);
       const percent = body.percentOff == null ? Number(existing.percent_off) : Number(body.percentOff);
       if (![10,20,50,100].includes(percent)) return reply(req,res,400,{ok:false,error:"Discount must be 10, 20, 50 or 100 percent."},json);
-      const expires = body.expiresAt === undefined ? existing.expires_at : (body.expiresAt ? new Date(body.expiresAt) : null);
-      if (expires && Number.isNaN(new Date(expires).getTime())) return reply(req,res,400,{ok:false,error:"Invalid expiry date."},json);
+      const starts = body.startsAt === undefined ? new Date(existing.starts_at) : (body.startsAt ? new Date(body.startsAt) : new Date());
+      const expires = body.expiresAt === undefined ? (existing.expires_at ? new Date(existing.expires_at) : null) : (body.expiresAt ? new Date(body.expiresAt) : null);
       const max = body.maxRedemptions === undefined ? existing.max_redemptions : (body.maxRedemptions === "" || body.maxRedemptions == null ? null : Number(body.maxRedemptions));
+      const eligiblePlan = body.eligiblePlan === undefined ? String(existing.eligible_plan || "annual") : String(body.eligiblePlan);
+      const perUserLimit = body.perUserLimit === undefined ? Number(existing.per_user_limit || 1) : Number(body.perUserLimit);
+      if (Number.isNaN(starts.getTime()) || (expires && Number.isNaN(expires.getTime())) || (expires && expires <= starts)) return reply(req,res,400,{ok:false,error:"Invalid discount start/end date range."},json);
+      if (!["annual","monthly","both"].includes(eligiblePlan)) return reply(req,res,400,{ok:false,error:"Eligible plan must be annual, monthly or both."},json);
+      if (!Number.isInteger(perUserLimit) || perUserLimit < 1 || perUserLimit > 1000000) return reply(req,res,400,{ok:false,error:"Per-user redemption limit must be a positive whole number."},json);
       if (max != null && (!Number.isInteger(max) || max < 1 || max < Number(existing.redeemed_count))) return reply(req,res,400,{ok:false,error:"Redemption limit must be positive and cannot be below existing redemptions."},json);
-      await db.prepare("UPDATE billing_discount_codes SET percent_off=?,expires_at=?,max_redemptions=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(percent,expires ? new Date(expires).toISOString() : null,max,id);
+      await db.prepare("UPDATE billing_discount_codes SET percent_off=?,starts_at=?,expires_at=?,max_redemptions=?,eligible_plan=?,per_user_limit=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(percent,starts.toISOString(),expires ? expires.toISOString() : null,max,eligiblePlan,perUserLimit,id);
       await audit(db,userId,"DISCOUNT_UPDATED",{id,percentOff:percent});
       return reply(req,res,200,{ok:true},json);
     }
