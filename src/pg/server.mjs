@@ -1015,7 +1015,7 @@ const server = http.createServer(async (req, res) => {
       return json(req, res, 200, { ok: true, device: await publicDevice(row) });
     }
 
-    const photoContentMatch = path.match(/^\\/api\\/devices\\/(\\d+)\\/photo-content$/);
+    const photoContentMatch = path.match(/^\/api\/devices\/(\d+)\/photo-content$/);
     if (req.method === "GET" && photoContentMatch) {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, photoContentMatch[1]);
@@ -1030,7 +1030,7 @@ const server = http.createServer(async (req, res) => {
       let mimeType;
       try {
         if (state.photo_data_url) {
-          const match = /^data:(image\\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(state.photo_data_url);
+          const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(state.photo_data_url);
           if (!match) throw new Error("Stored legacy photo is invalid");
           const parsed = parsePhotoPayload(match[2], match[1]);
           bytes = parsed.bytes;
@@ -1056,7 +1056,7 @@ const server = http.createServer(async (req, res) => {
       res.statusCode = 200;
       res.setHeader("Content-Type", mimeType);
       res.setHeader("Content-Length", String(bytes.length));
-      res.setHeader("Content-Disposition", `${url.searchParams.get("download") === "1" ? "attachment" : "inline"}; filename="jazz-recovery-current.${mimeType === "image/png" ? "png" : "jpg"}"`);
+      res.setHeader("Content-Disposition", (url.searchParams.get("download") === "1" ? "attachment" : "inline") + "; filename=\"jazz-recovery-current." + (mimeType === "image/png" ? "png" : "jpg") + "\"");
       res.setHeader("Cache-Control", "private, no-store, max-age=0");
       res.end(bytes);
       return;
