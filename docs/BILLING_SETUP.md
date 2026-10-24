@@ -7,7 +7,7 @@ This guide applies to the isolated subscription feature branch. It does not auth
 - Monthly: ₹49 (4900 paise), one calendar month.
 - Annual: ₹399 (39900 paise), twelve calendar months.
 - A new eligible username receives one seven-day trial. Trial claims are retained as a username HMAC in PostgreSQL so deleting/recreating an account does not automatically grant another trial.
-- Discount codes apply to the annual plan only. The server computes every amount in integer paise.
+- Discount codes can be configured for annual, monthly, or both plans. The server computes every amount in integer paise.
 - `jazzry10` is seeded as an active 10% annual discount when `JAZZ_DISCOUNT_CODE_PEPPER` is configured.
 - `jazzfamly` is seeded as a disabled 100% complimentary annual code. In the owner controls, set a maximum redemption count and save it before enabling the code. This prevents an accidental unlimited free-access code.
 - A 100% code grants a complimentary entitlement without pretending a Razorpay payment occurred.
@@ -45,7 +45,7 @@ Generate high-entropy secrets locally with a trusted password manager or PowerSh
 2. Configure the one-time `JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET`, sign in as the owner, and use the existing billing admin claim flow once. Remove the bootstrap secret from Render after successful claim.
 3. The server seeds `jazzry10` and `jazzfamly` on PostgreSQL when `JAZZ_DISCOUNT_CODE_PEPPER` is configured. The seed is insert-only; it does not overwrite owner changes.
 4. In Owner Controls, set a maximum redemption limit for `jazzfamly`, save it, then enable it. Keep it disabled until its limit is set.
-5. Confirm `jazzry10` previews 10% off ₹399 (₹359.10) and `jazzfamly` previews ₹0 only after it is enabled.
+5. Confirm `jazzry10` previews 10% off ₹399 (₹359.10). `jazzfamly` previews ₹0 only after it is enabled. Each code supports start/end dates, eligible plan, overall redemption cap, and per-user redemption cap.
 
 ## Test checklist
 
