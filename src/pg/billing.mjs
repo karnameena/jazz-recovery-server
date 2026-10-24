@@ -227,7 +227,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       await db.transaction(async () => {
         if (discount) {
           const locked = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=? FOR UPDATE").get(discount.id);
-          if (!codeIsValid(locked)) throw Object.assign(new Error("This discount code is no longer available."),{status:409});
+          if (!codeIsValid(locked) || !codeEligibleForPlan(locked,plan)) throw Object.assign(new Error("This discount code is no longer available for the selected plan."),{status:409});
           const used = await db.prepare("SELECT COUNT(*) AS total FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId);
           if (Number(used?.total || 0) >= Number(locked.per_user_limit || 1)) {
             throw Object.assign(new Error("This account has reached this discount code's per-user redemption limit."),{status:409});
