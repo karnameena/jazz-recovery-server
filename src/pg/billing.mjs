@@ -180,7 +180,6 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
     const activeSubscription = await db.prepare("SELECT id FROM billing_subscriptions WHERE user_id=? AND status IN ('active','complimentary') AND expires_at>CURRENT_TIMESTAMP LIMIT 1").get(userId);
     if (activeSubscription) return reply(req,res,409,{ok:false,error:"Your subscription is already active. You can subscribe again after the current access period ends."},json);
     let discount = null;
-    if (plan === "monthly" && String(body.code || "").trim()) return reply(req,res,400,{ok:false,error:"Discount codes apply to the annual plan only."},json);
     if (String(body.code || "").trim()) {
       try { discount = await getCode(body.code,db); } catch (error) { return reply(req,res,error.status || 503,{ok:false,error:error.message},json); }
       if (!codeIsValid(discount) || !codeEligibleForPlan(discount,plan)) return reply(req,res,409,{ok:false,error:"This discount code is invalid, unavailable, or not eligible for the selected plan."},json);
@@ -230,8 +229,9 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
         if (discount) {
           const locked = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=? FOR UPDATE").get(discount.id);
           if (!codeIsValid(locked)) throw Object.assign(new Error("This discount code is no longer available."),{status:409});
-          if (await db.prepare("SELECT id FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId)) {
-            throw Object.assign(new Error("This account has already redeemed this code."),{status:409});
+          const used = await db.prepare("SELECT COUNT(*) AS total FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId);
+          if (Number(used?.total || 0) >= Number(locked.per_user_limit || 1)) {
+            throw Object.assign(new Error("This account has reached this discount code's per-user redemption limit."),{status:409});
           }
           if (await db.prepare("SELECT id FROM billing_payments WHERE discount_code_id=? AND user_id=? AND status='created' LIMIT 1").get(discount.id,userId)) {
             throw Object.assign(new Error("A checkout for this code is already pending on this account."),{status:409});
