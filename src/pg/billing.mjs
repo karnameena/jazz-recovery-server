@@ -39,7 +39,6 @@ function codeEligibleForPlan(row, plan) {
 }
 export function discountedPrice(percent, plan = "annual") {
   if (!Number.isInteger(percent) || ![10,20,50,100].includes(percent)) throw new Error("Unsupported discount percentage");
-  if (normalizePlan(plan) !== "annual") throw new Error("Discount codes are available for the annual plan only");
   return Math.round(PLAN_PRICES_PAISE[normalizePlan(plan)] * (100 - percent) / 100);
 }
 function reply(req, res, status, body, json) { json(req, res, status, body); return true; }
