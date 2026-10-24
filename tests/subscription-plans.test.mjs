@@ -13,8 +13,9 @@ test("annual discount amounts are calculated from ₹399", () => {
   assert.equal(discountedPrice(100), 0);
 });
 
-test("discount codes cannot be applied to monthly plan", () => {
-  assert.throws(() => discountedPrice(10, "monthly"), /annual plan only/);
+test("discount amounts are calculated from the selected plan", () => {
+  assert.equal(discountedPrice(10, "monthly"), 4410);
+  assert.equal(discountedPrice(50, "monthly"), 2450);
 });
 
 test("unsupported discounts and plans are rejected", () => {
