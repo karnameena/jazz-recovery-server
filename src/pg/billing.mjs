@@ -263,15 +263,16 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
         return reply(req,res,error.status || 500,{ok:false,error:error.message || "Could not create discount"},json);
       }
     }
-    const actionMatch = path.match(/^\/api\/billing\/admin\/discount-codes\/([a-f0-9-]+)\/(disable|rotate|update)$/i);
+    const actionMatch = path.match(/^\/api\/billing\/admin\/discount-codes\/([a-f0-9-]+)\/(disable|enable|rotate|update)$/i);
     if (req.method === "POST" && actionMatch) {
       const [,id,action] = actionMatch;
       const existing = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=?").get(id);
       if (!existing) return reply(req,res,404,{ok:false,error:"Discount code not found"},json);
-      if (action === "disable") {
-        await db.prepare("UPDATE billing_discount_codes SET active=FALSE,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(id);
-        await audit(db,userId,"DISCOUNT_DISABLED",{id});
-        return reply(req,res,200,{ok:true},json);
+      if (action === "disable" || action === "enable") {
+        const active = action === "enable";
+        await db.prepare("UPDATE billing_discount_codes SET active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(active,id);
+        await audit(db,userId,active ? "DISCOUNT_ENABLED" : "DISCOUNT_DISABLED",{id});
+        return reply(req,res,200,{ok:true,active},json);
       }
       if (action === "rotate") {
         const code = String((await jsonBody(req,readJson)).code || makeCode()).trim().toUpperCase();
