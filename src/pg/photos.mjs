@@ -31,6 +31,18 @@ export function parsePhotoPayload(imageBase64, declaredMimeType) {
   return { bytes, mimeType, extension: mimeType === "image/png" ? "png" : "jpg" };
 }
 
+// A legacy data URL may be migrated only while it is still the current source
+// and no object-storage reference has already been committed for this device.
+export function shouldMigrateLegacyPhoto(currentState, legacyDataUrl) {
+  return Boolean(
+    currentState &&
+    !currentState.photo_object_key &&
+    typeof legacyDataUrl === "string" &&
+    legacyDataUrl.length > 0 &&
+    currentState.photo_data_url === legacyDataUrl
+  );
+}
+
 export function photoStorageConfigured() {
   return Boolean(
     process.env.AWS_ENDPOINT_URL_S3 &&
