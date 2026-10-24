@@ -6,7 +6,7 @@ function normalizePlan(value) {
   if (!Object.hasOwn(PLAN_PRICES_PAISE, plan)) throw Object.assign(new Error("Choose a valid subscription plan."), { status: 400 });
   return plan;
 }
-function planExpiry(startMs, plan) {
+export function planExpiry(startMs, plan) {
   const start = new Date(startMs);
   const target = new Date(startMs);
   const day = start.getUTCDate();
@@ -56,6 +56,22 @@ async function audit(db, actorId, action, details = {}) {
     .run(actorId ?? null, action, JSON.stringify(details));
 }
 function makeCode() { return "JAZZ-" + crypto.randomBytes(6).toString("hex").toUpperCase(); }
+
+export async function ensureDefaultDiscountCodes(db) {
+  const pepper = String(process.env.JAZZ_DISCOUNT_CODE_PEPPER || "");
+  if (!pepper) return { seeded: false, reason: "discount pepper not configured" };
+  const defaults = [
+    { code: "jazzry10", label: "jazzry10 · 10% off annual", percent: 10, active: true },
+    // Complimentary codes are created disabled until the owner sets a redemption limit.
+    { code: "jazzfamly", label: "jazzfamly · complimentary annual", percent: 100, active: false }
+  ];
+  for (const item of defaults) {
+    const hash = crypto.createHmac("sha256", pepper).update(item.code.toUpperCase()).digest("hex");
+    await db.prepare("INSERT INTO billing_discount_codes(id,code_hash,label,percent_off,active) VALUES(?,?,?,?,?) ON CONFLICT(code_hash) DO NOTHING")
+      .run(crypto.randomUUID(), hash, item.label, item.percent, item.active);
+  }
+  return { seeded: true };
+}
 async function getCode(code, db) {
   return await db.prepare("SELECT * FROM billing_discount_codes WHERE code_hash=?").get(digestCode(code));
 }
@@ -270,6 +286,9 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       if (!existing) return reply(req,res,404,{ok:false,error:"Discount code not found"},json);
       if (action === "disable" || action === "enable") {
         const active = action === "enable";
+        if (active && Number(existing.percent_off) === 100 && existing.max_redemptions == null) {
+          return reply(req,res,409,{ok:false,error:"Set a maximum redemption limit before enabling a 100% complimentary code."},json);
+        }
         await db.prepare("UPDATE billing_discount_codes SET active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(active,id);
         await audit(db,userId,active ? "DISCOUNT_ENABLED" : "DISCOUNT_DISABLED",{id});
         return reply(req,res,200,{ok:true,active},json);
