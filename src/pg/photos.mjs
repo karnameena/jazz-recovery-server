@@ -78,6 +78,16 @@ export async function uploadPhotoObject({ key, bytes, mimeType }) {
   return key;
 }
 
+export async function getPhotoObject(key) {
+  if (typeof key !== "string" || !key.startsWith("devices/") || key.includes("..")) {
+    throw new Error("Invalid current photo reference.");
+  }
+  return storageClient().send(new GetObjectCommand({
+    Bucket: process.env.JAZZ_PHOTO_BUCKET,
+    Key: key
+  }));
+}
+
 export async function signedPhotoUrl(key, { download = false } = {}) {
   if (typeof key !== "string" || !key.startsWith("devices/") || key.includes("..")) {
     throw new Error("Invalid current photo reference.");
