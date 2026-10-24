@@ -235,7 +235,7 @@ function locationServicesState(value) {
 }
 
 async function migrateLegacyPhotoToObjectStorage(deviceId, legacyState) {
-  const match = /^data:(image\\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(legacyState.photo_data_url || ""));
+  const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(legacyState.photo_data_url || ""));
   if (!match) return false;
   const parsed = parsePhotoPayload(match[2], match[1]);
   const key = currentPhotoKey(deviceId, crypto.randomUUID(), parsed.extension);
