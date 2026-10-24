@@ -193,7 +193,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
         const sub = await db.transaction(async () => {
           if (discount) {
             const locked = await db.prepare("SELECT * FROM billing_discount_codes WHERE id=? FOR UPDATE").get(discount.id);
-            if (!codeIsValid(locked)) throw Object.assign(new Error("This discount code is no longer available."),{status:409});
+            if (!codeIsValid(locked) || !codeEligibleForPlan(locked,plan)) throw Object.assign(new Error("This discount code is no longer available for the selected plan."),{status:409});
             const used = await db.prepare("SELECT COUNT(*) AS total FROM billing_discount_redemptions WHERE discount_code_id=? AND user_id=?").get(discount.id,userId);
             if (Number(used?.total || 0) >= Number(locked.per_user_limit || 1)) throw Object.assign(new Error("This account has reached this discount code's per-user redemption limit."),{status:409});
           }
@@ -280,6 +280,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       const label = String(body.label || (percent+"% discount")).trim().slice(0,100);
       const max = body.maxRedemptions == null || body.maxRedemptions === "" ? null : Number(body.maxRedemptions);
       if (max != null && (!Number.isInteger(max) || max < 1 || max > 1000000)) return reply(req,res,400,{ok:false,error:"Redemption limit must be a positive whole number."},json);
+      if (percent === 100 && max == null) return reply(req,res,400,{ok:false,error:"A 100% complimentary code must have a maximum redemption limit."},json);
       const starts = body.startsAt ? new Date(body.startsAt) : new Date();
       const expires = body.expiresAt ? new Date(body.expiresAt) : null;
       const eligiblePlan = String(body.eligiblePlan || "annual");
@@ -333,6 +334,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       if (!["annual","monthly","both"].includes(eligiblePlan)) return reply(req,res,400,{ok:false,error:"Eligible plan must be annual, monthly or both."},json);
       if (!Number.isInteger(perUserLimit) || perUserLimit < 1 || perUserLimit > 1000000) return reply(req,res,400,{ok:false,error:"Per-user redemption limit must be a positive whole number."},json);
       if (max != null && (!Number.isInteger(max) || max < 1 || max < Number(existing.redeemed_count))) return reply(req,res,400,{ok:false,error:"Redemption limit must be positive and cannot be below existing redemptions."},json);
+      if (percent === 100 && max == null) return reply(req,res,400,{ok:false,error:"A 100% complimentary code must have a maximum redemption limit."},json);
       await db.prepare("UPDATE billing_discount_codes SET percent_off=?,starts_at=?,expires_at=?,max_redemptions=?,eligible_plan=?,per_user_limit=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(percent,starts.toISOString(),expires ? expires.toISOString() : null,max,eligiblePlan,perUserLimit,id);
       await audit(db,userId,"DISCOUNT_UPDATED",{id,percentOff:percent});
       return reply(req,res,200,{ok:true},json);
