@@ -1,5 +1,5 @@
 const command = String(process.argv[2] || "");
-const allowed = new Set(["create-owner", "create-device", "change-owner-password", "rotate-device"]);
+const allowed = new Set(["create-owner", "create-device", "change-owner-password", "rotate-device", "list-users", "recover-billing-admin"]);
 if (!allowed.has(command)) throw new Error("Unknown recovery administration command");
 
 // Administrative scripts follow the same Neon-only policy as the API runtime.
