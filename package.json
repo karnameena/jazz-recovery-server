@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/entrypoint.mjs",
+    "start": "node --env-file-if-exists=.env src/entrypoint.mjs",
     "migrate": "node src/pg/migrate.mjs",
     "create-owner": "node src/scripts/dispatch.mjs create-owner",
     "change-owner-password": "node src/scripts/dispatch.mjs change-owner-password",
