@@ -7,6 +7,8 @@
     "migrate": "node src/pg/migrate.mjs",
     "create-owner": "node src/scripts/dispatch.mjs create-owner",
     "change-owner-password": "node src/scripts/dispatch.mjs change-owner-password",
+    "list-users": "node src/scripts/dispatch.mjs list-users",
+    "recover-billing-admin": "node src/scripts/dispatch.mjs recover-billing-admin",
     "create-device": "node src/scripts/dispatch.mjs create-device",
     "rotate-device": "node src/scripts/dispatch.mjs rotate-device",
     "pg:migrate": "node src/pg/migrate.mjs",
