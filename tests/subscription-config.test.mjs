@@ -11,7 +11,9 @@ test("monthly and yearly plan prices and durations come from subscription-config
   assert.deepEqual(PLAN_PRICES_PAISE, { monthly: 4900, annual: 39900 });
   assert.deepEqual(PLAN_DURATIONS_MONTHS, { monthly: 1, annual: 12 });
   assert.equal(PLAN_CONFIG.monthly.label, "Monthly");
-  assert.equal(PLAN_CONFIG.annual.label, "Yearly");
+  assert.equal(PLAN_CONFIG.monthly.periodLabel, "1 month");
+  assert.equal(PLAN_CONFIG.annual.label, "Annual");
+  assert.equal(PLAN_CONFIG.annual.periodLabel, "12 months");
 });
 
 test("configured monthly plan expiry handles short calendar months", () => {
