@@ -1,0 +1,25 @@
+name: Subscription ledger unit checks
+on:
+  pull_request:
+    branches: [feature/neon-only-runtime-cleanup-20261024]
+  push:
+    branches: [feature/per-user-trial-subscription-ledger-20261025]
+permissions:
+  contents: read
+jobs:
+  subscription-ledger-unit-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Check billing and server syntax
+        run: |
+          node --check src/pg/server.mjs
+          node --check src/pg/billing.mjs
+          node --check src/pg/subscription-config.mjs
+      - name: Test configurable trial and subscription policy
+        run: node --test tests/subscription-config.test.mjs tests/subscription-plans.test.mjs
