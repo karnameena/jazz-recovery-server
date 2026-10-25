@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS } from "./subscription-config.mjs";
+import { PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS, TRIAL_USERS } from "./subscription-config.mjs";
 export { PLAN_PRICES_PAISE };
 function normalizePlan(value) {
   const plan = String(value || "annual").toLowerCase();
@@ -274,7 +274,18 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
   if (path.startsWith("/api/billing/admin/")) {
     if (!(await adminCheck(userId,db))) return reply(req,res,403,{ok:false,error:"Owner/admin access required"},json);
     if (req.method === "GET" && path === "/api/billing/admin/user-ledger") {
-      // User-specific entitlement records live in PostgreSQL, never in tracked JSON config.
+      // Explicit per-user trial overrides in trial.config.json are reconciled only when
+      // the authenticated owner refreshes this ledger. PostgreSQL remains authoritative.
+      // Unlisted users and disabled overrides do not modify existing trial records.
+      for (const [configuredUsername, configuredTrial] of Object.entries(TRIAL_USERS)) {
+        if (!configuredTrial.enabled) continue;
+        const user = await db.prepare("SELECT id FROM public.users WHERE LOWER(username)=LOWER(?)").get(configuredUsername);
+        if (!user) continue;
+        await db.prepare(
+          "INSERT INTO public.billing_trials(user_id,starts_at,expires_at) VALUES(?,?,?) " +
+          "ON CONFLICT(user_id) DO UPDATE SET starts_at=EXCLUDED.starts_at,expires_at=EXCLUDED.expires_at"
+        ).run(user.id, configuredTrial.startsAt, configuredTrial.endsAt);
+      }
       // Return each user trial and every subscription record without exposing secrets or payment tokens.
       const rows = await db.prepare([
         "SELECT u.username, t.starts_at AS trial_started_at, t.expires_at AS trial_ends_at, " +
