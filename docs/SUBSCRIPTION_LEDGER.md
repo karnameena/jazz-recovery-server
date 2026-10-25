@@ -2,10 +2,24 @@
 
 ## Editable policy files
 
-- `trial.config.json`: `trialDays` controls the length of a newly claimed trial (default: 7 days).
+- `trial.config.json`: `trialDays` controls the default length of a newly claimed trial (default: 7 days). Its optional `users` object supports explicit per-username overrides with `enabled`, `startDate`, `endDate`, and `description`.
 - `subscription-config.json`: monthly/yearly price in paise and calendar-month duration. Prices and durations are validated when the server starts.
 
-These files define policy only. Do not add usernames or per-user activation records to them: the deployed filesystem may be ephemeral, and JSON files are not safe as the authoritative record when multiple server instances are running.
+Example per-user override (add inside `trial.config.json` under `users`):
+```json
+{
+  "karnameena1": {
+    "enabled": true,
+    "startDate": "2026-10-25T00:00:00+05:30",
+    "endDate": "2026-11-01T23:59:59+05:30",
+    "description": "Manually managed trial period"
+  }
+}
+```
+
+The username entry is an override, not the user registry. For a new registration, the configured timestamps are used instead of the default duration. For an existing account, an enabled override is applied to its PostgreSQL trial record when the authenticated owner refreshes the per-user ledger. Removing an override does not delete or reset the PostgreSQL record; an entry with `enabled: false` prevents a configured trial from being granted to a newly registered account and does not revoke an already-issued trial. Dates must be ISO timestamps with an explicit timezone and `endDate` must be after `startDate`.
+
+PostgreSQL remains the authoritative persistent store for all actual per-user trial and subscription records. Do not treat JSON as a dynamically written user database; this avoids data loss on redeploy and inconsistencies across server instances.
 
 ## Durable per-user records
 
