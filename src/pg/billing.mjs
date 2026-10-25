@@ -251,25 +251,9 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
   }
 
   if (req.method === "POST" && path === "/api/billing/admin/claim") {
-    // Trim accidental copy/paste whitespace, but never log or return either secret.
-    const bootstrap = String(process.env.JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET || "").trim();
-    const supplied = String((await jsonBody(req,readJson)).bootstrapSecret || "").trim();
-    if (!bootstrap) {
-      return reply(req,res,503,{ok:false,error:"Billing admin bootstrap secret is missing from the running API environment. Set JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET in this backend's .env and restart this API process."},json);
-    }
-    if (!safeEqual(supplied,bootstrap)) {
-      return reply(req,res,403,{ok:false,error:"Bootstrap secret mismatch. The secret loaded by the API process does not match the submitted value. Verify the backend process/port, then restart that API after saving .env."},json);
-    }
-    try {
-      await db.transaction(async () => {
-        await db.prepare("SELECT pg_advisory_xact_lock(7482362)").get();
-        const count = Number((await db.prepare("SELECT COUNT(*) AS total FROM billing_admins").get()).total);
-        if (count) throw Object.assign(new Error("An admin is already configured"),{status:409});
-        await db.prepare("INSERT INTO billing_admins(user_id) VALUES(?) ON CONFLICT DO NOTHING").run(userId);
-        await audit(db,userId,"BILLING_ADMIN_CLAIM",{});
-      });
-      return reply(req,res,201,{ok:true,isAdmin:true},json);
-    } catch(error) { return reply(req,res,error.status || 500,{ok:false,error:error.message},json); }
+    // Public bootstrap is intentionally disabled. Assign or recover the billing
+    // administrator only through the private PostgreSQL administration CLI.
+    return reply(req,res,410,{ok:false,error:"Public billing-admin setup is disabled. Use the private server command recover-billing-admin."},json);
   }
 
   if (path.startsWith("/api/billing/admin/")) {
