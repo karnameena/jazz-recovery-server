@@ -36,6 +36,8 @@ jobs:
           node --check src/entrypoint.mjs
           node --check src/pg/database.mjs
           node --check src/pg/server.mjs
+          node --check src/pg/billing.mjs
+          node --check src/pg/subscription-config.mjs
           node --check src/pg/sessions.mjs
           node --check src/scripts/dispatch.mjs
           node --check src/scripts/pg-create-owner.mjs
@@ -43,7 +45,11 @@ jobs:
           node --check src/scripts/pg-change-owner-password.mjs
           node --check src/scripts/pg-rotate-device.mjs
           node --check tests/postgres-only-runtime.test.mjs
+          node --check tests/subscription-config.test.mjs
+          node --check tests/subscription-plans.test.mjs
       - name: Enforce PostgreSQL-only runtime and administration
         run: node --test tests/postgres-only-runtime.test.mjs
+      - name: Validate trial and subscription configuration
+        run: node --test tests/subscription-config.test.mjs tests/subscription-plans.test.mjs
       - name: PostgreSQL-backed recovery workflow integration test
         run: node --test tests/postgres-migration.test.mjs
