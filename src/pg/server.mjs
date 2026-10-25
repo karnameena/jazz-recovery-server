@@ -6,7 +6,7 @@ import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthen
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
 import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
 import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
-import { TRIAL_DAYS } from "./subscription-config.mjs";
+import { TRIAL_DAYS, getTrialConfigForUsername } from "./subscription-config.mjs";
 
 await applyMigrations();
 await ensureDefaultDiscountCodes(db);
@@ -682,12 +682,17 @@ const server = http.createServer(async (req, res) => {
           let trialActivated = false;
           let trialStartsAt = null;
           let trialEndsAt = null;
-          if (TRIAL_DAYS > 0) {
+          const userTrialConfig = getTrialConfigForUsername(username);
+          const trialEnabled = userTrialConfig ? userTrialConfig.enabled : TRIAL_DAYS > 0;
+          if (trialEnabled) {
             const claim = await db.prepare("INSERT INTO billing_trial_claims(username_hash,user_id) VALUES(?,?) ON CONFLICT DO NOTHING RETURNING username_hash")
               .get(trialClaimHash(username), user.id);
             if (claim) {
-              const trial = await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + (? * INTERVAL '1 day')) RETURNING starts_at,expires_at")
-                .get(user.id, TRIAL_DAYS);
+              const trial = userTrialConfig
+                ? await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,?,?) RETURNING starts_at,expires_at")
+                    .get(user.id, userTrialConfig.startsAt, userTrialConfig.endsAt)
+                : await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + (? * INTERVAL '1 day')) RETURNING starts_at,expires_at")
+                    .get(user.id, TRIAL_DAYS);
               trialActivated = true;
               trialStartsAt = trial.starts_at;
               trialEndsAt = trial.expires_at;
