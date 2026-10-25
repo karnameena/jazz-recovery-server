@@ -1,0 +1,23 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { TRIAL_DAYS, PLAN_CONFIG, PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS } from "../src/pg/subscription-config.mjs";
+import { planExpiry } from "../src/pg/billing.mjs";
+
+test("new eligible accounts receive a seven-day trial by default", () => {
+  assert.equal(TRIAL_DAYS, 7);
+});
+
+test("monthly and yearly plan prices and durations come from subscription-config.json", () => {
+  assert.deepEqual(PLAN_PRICES_PAISE, { monthly: 4900, annual: 39900 });
+  assert.deepEqual(PLAN_DURATIONS_MONTHS, { monthly: 1, annual: 12 });
+  assert.equal(PLAN_CONFIG.monthly.label, "Monthly");
+  assert.equal(PLAN_CONFIG.annual.label, "Yearly");
+});
+
+test("configured monthly plan expiry handles short calendar months", () => {
+  assert.equal(planExpiry(Date.UTC(2026, 0, 31, 12), "monthly").toISOString(), "2026-02-28T12:00:00.000Z");
+});
+
+test("configured yearly plan expiry handles leap day", () => {
+  assert.equal(planExpiry(Date.UTC(2024, 1, 29, 12), "annual").toISOString(), "2025-02-28T12:00:00.000Z");
+});
