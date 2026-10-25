@@ -20,7 +20,7 @@ for (const [username, entry] of Object.entries(trial.users)) {
   if (!entry || typeof entry !== "object" || typeof entry.enabled !== "boolean") throw new Error(`trial.config.json users.${username}.enabled must be true or false.`);
   if (typeof entry.description !== "string") throw new Error(`trial.config.json users.${username}.description must be a string.`);
   if (typeof entry.startDate !== "string" || typeof entry.endDate !== "string" ||
-      !/(?:Z|[+-]\\d{2}:\\d{2})$/.test(entry.startDate) || !/(?:Z|[+-]\\d{2}:\\d{2})$/.test(entry.endDate)) {
+      !/(?:Z|[+-]\d{2}:\d{2})$/.test(entry.startDate) || !/(?:Z|[+-]\d{2}:\d{2})$/.test(entry.endDate)) {
     throw new Error(`trial.config.json users.${username} dates must be ISO timestamps with a timezone offset.`);
   }
   const startsAt = Date.parse(entry.startDate);
