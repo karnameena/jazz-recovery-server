@@ -1,0 +1,4 @@
+{
+  "trialDays": 7,
+  "description": "New eligible accounts receive one 7-day trial. Per-user trial records are stored in PostgreSQL."
+}
