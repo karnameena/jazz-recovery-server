@@ -153,10 +153,11 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
   if (req.method === "GET" && path === "/api/billing/status") {
     const trial = await db.prepare("SELECT starts_at,expires_at FROM billing_trials WHERE user_id=?").get(userId);
     const subscription = await db.prepare("SELECT status,starts_at,expires_at,amount_paid_paise,plan_type FROM billing_subscriptions WHERE user_id=? AND status IN ('active','complimentary') ORDER BY expires_at DESC LIMIT 1").get(userId);
+    const isBillingAdmin = await adminCheck(userId, db);
     const now = Date.now();
     const paid = Boolean(subscription && new Date(subscription.expires_at).getTime() > now);
     const trialing = Boolean(trial && new Date(trial.starts_at).getTime() <= now && new Date(trial.expires_at).getTime() > now);
-    return reply(req,res,200,{ok:true,pricePaise:PLAN_PRICES_PAISE.annual,plans:PLAN_PRICES_PAISE,trial:trial ? {startsAt:trial.starts_at,expiresAt:trial.expires_at,active:trialing} : null,subscription:subscription ? {...subscription,active:paid} : null,access:paid ? "subscribed" : trialing ? "trial" : "expired",canUsePaidFeatures:paid || trialing},json);
+    return reply(req,res,200,{ok:true,pricePaise:PLAN_PRICES_PAISE.annual,plans:PLAN_PRICES_PAISE,trial:trial ? {startsAt:trial.starts_at,expiresAt:trial.expires_at,active:trialing} : null,subscription:subscription ? {...subscription,active:paid} : null,access:paid ? "subscribed" : trialing ? "trial" : "expired",canUsePaidFeatures:paid || trialing,isBillingAdmin},json);
   }
 
   if (req.method === "POST" && path === "/api/billing/discount/validate") {
