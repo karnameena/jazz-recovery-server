@@ -273,6 +273,66 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
 
   if (path.startsWith("/api/billing/admin/")) {
     if (!(await adminCheck(userId,db))) return reply(req,res,403,{ok:false,error:"Owner/admin access required"},json);
+    if (req.method === "POST" && path === "/api/billing/admin/user-ledger/update") {
+      const body = await jsonBody(req,readJson);
+      const username = String(body.username || "").trim();
+      if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) return reply(req,res,400,{ok:false,error:"Enter a valid username."},json);
+      const user = await db.prepare("SELECT id,username FROM public.users WHERE LOWER(username)=LOWER(?)").get(username);
+      if (!user) return reply(req,res,404,{ok:false,error:"Registered user not found."},json);
+      const parseDate = (value, label) => {
+        const date = new Date(String(value || ""));
+        if (!value || !Number.isFinite(date.getTime())) throw Object.assign(new Error(label + " must be a valid date and time."),{status:400});
+        return date;
+      };
+      try {
+        const trialStart = parseDate(body.trialStartAt, "Trial start");
+        const trialEnd = parseDate(body.trialEndAt, "Trial end");
+        if (trialEnd <= trialStart) throw Object.assign(new Error("Trial end must be after trial start."),{status:400});
+        let subscriptionStart = null;
+        let subscriptionEnd = null;
+        let durationMonths = null;
+        if (body.subscriptionStartAt || body.subscriptionDurationMonths != null) {
+          subscriptionStart = parseDate(body.subscriptionStartAt, "Subscription start");
+          durationMonths = Number(body.subscriptionDurationMonths);
+          if (!Number.isInteger(durationMonths) || durationMonths < 1 || durationMonths > 120) {
+            throw Object.assign(new Error("Subscription duration must be a whole number from 1 to 120 months."),{status:400});
+          }
+          subscriptionEnd = new Date(subscriptionStart.getTime());
+          const originalDay = subscriptionEnd.getUTCDate();
+          subscriptionEnd.setUTCDate(1);
+          subscriptionEnd.setUTCMonth(subscriptionEnd.getUTCMonth() + durationMonths);
+          const lastDay = new Date(Date.UTC(subscriptionEnd.getUTCFullYear(),subscriptionEnd.getUTCMonth()+1,0)).getUTCDate();
+          subscriptionEnd.setUTCDate(Math.min(originalDay,lastDay));
+        }
+        await db.transaction(async () => {
+          await db.prepare(
+            "INSERT INTO public.billing_trials(user_id,starts_at,expires_at) VALUES(?,?,?) " +
+            "ON CONFLICT(user_id) DO UPDATE SET starts_at=EXCLUDED.starts_at,expires_at=EXCLUDED.expires_at"
+          ).run(user.id,trialStart.toISOString(),trialEnd.toISOString());
+          if (subscriptionStart && subscriptionEnd) {
+            const existing = await db.prepare("SELECT id FROM public.billing_subscriptions WHERE user_id=? AND status IN ('active','complimentary') ORDER BY created_at DESC NULLS LAST LIMIT 1 FOR UPDATE").get(user.id);
+            if (existing) {
+              await db.prepare("UPDATE public.billing_subscriptions SET starts_at=?,expires_at=? WHERE id=?")
+                .run(subscriptionStart.toISOString(),subscriptionEnd.toISOString(),existing.id);
+            } else {
+              await db.prepare("INSERT INTO public.billing_subscriptions(id,user_id,status,starts_at,expires_at,amount_paid_paise,plan_type) VALUES(?,?,'complimentary',?,?,0,?)")
+                .run(crypto.randomUUID(),user.id,subscriptionStart.toISOString(),subscriptionEnd.toISOString(),durationMonths === 1 ? "monthly" : "annual");
+            }
+          }
+          await audit(db,userId,"USER_ENTITLEMENT_DATES_UPDATED",{
+            targetUsername:user.username,
+            trialStartsAt:trialStart.toISOString(),
+            trialEndsAt:trialEnd.toISOString(),
+            subscriptionStartsAt:subscriptionStart?.toISOString() || null,
+            subscriptionDurationMonths:durationMonths,
+            subscriptionEndsAt:subscriptionEnd?.toISOString() || null
+          });
+        });
+        return reply(req,res,200,{ok:true,username:user.username,trialStartsAt:trialStart.toISOString(),trialEndsAt:trialEnd.toISOString(),subscriptionStartsAt:subscriptionStart?.toISOString() || null,subscriptionEndsAt:subscriptionEnd?.toISOString() || null,subscriptionDurationMonths:durationMonths},json);
+      } catch(error) {
+        return reply(req,res,error.status || 500,{ok:false,error:error.message || "Could not update trial/subscription dates."},json);
+      }
+    }
     if (req.method === "GET" && path === "/api/billing/admin/user-ledger") {
       // Explicit per-user trial overrides in trial.config.json are reconciled only when
       // the authenticated owner refreshes this ledger. PostgreSQL remains authoritative.
@@ -300,7 +360,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       const now = Date.now();
       const items = rows.map(row => ({
         ...row,
-        subscription_duration_months: row.subscription_plan ? (PLAN_DURATIONS_MONTHS[row.subscription_plan] || null) : null,
+        subscription_duration_months: row.subscription_started_at && row.subscription_ends_at ? (() => { const start = new Date(row.subscription_started_at); const end = new Date(row.subscription_ends_at); let months = (end.getUTCFullYear()-start.getUTCFullYear())*12 + end.getUTCMonth()-start.getUTCMonth(); const anchor = new Date(start); anchor.setUTCDate(1); anchor.setUTCMonth(anchor.getUTCMonth()+months); const day = start.getUTCDate(); anchor.setUTCDate(Math.min(day,new Date(Date.UTC(anchor.getUTCFullYear(),anchor.getUTCMonth()+1,0)).getUTCDate())); if (anchor.getTime() < end.getTime()) months++; return months > 0 ? months : (PLAN_DURATIONS_MONTHS[row.subscription_plan] || null); })() : null,
         trial_active: Boolean(row.trial_started_at && row.trial_ends_at &&
           new Date(row.trial_started_at).getTime() <= now && new Date(row.trial_ends_at).getTime() > now),
         subscription_active: Boolean(row.subscription_started_at && row.subscription_ends_at &&
