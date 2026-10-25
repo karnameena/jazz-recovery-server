@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS, TRIAL_USERS } from "./subscription-config.mjs";
+import { PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS, PLAN_CONFIG, TRIAL_USERS } from "./subscription-config.mjs";
 export { PLAN_PRICES_PAISE };
 function normalizePlan(value) {
   const plan = String(value || "annual").toLowerCase();
@@ -157,7 +157,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
     const now = Date.now();
     const paid = Boolean(subscription && new Date(subscription.expires_at).getTime() > now);
     const trialing = Boolean(trial && new Date(trial.starts_at).getTime() <= now && new Date(trial.expires_at).getTime() > now);
-    return reply(req,res,200,{ok:true,pricePaise:PLAN_PRICES_PAISE.annual,plans:PLAN_PRICES_PAISE,trial:trial ? {startsAt:trial.starts_at,expiresAt:trial.expires_at,active:trialing} : null,subscription:subscription ? {...subscription,active:paid} : null,access:paid ? "subscribed" : trialing ? "trial" : "expired",canUsePaidFeatures:paid || trialing,isBillingAdmin},json);
+    return reply(req,res,200,{ok:true,pricePaise:PLAN_PRICES_PAISE.annual,plans:PLAN_PRICES_PAISE,planDetails:PLAN_CONFIG,trial:trial ? {startsAt:trial.starts_at,expiresAt:trial.expires_at,active:trialing} : null,subscription:subscription ? {...subscription,active:paid} : null,access:paid ? "subscribed" : trialing ? "trial" : "expired",canUsePaidFeatures:paid || trialing,isBillingAdmin},json);
   }
 
   if (req.method === "POST" && path === "/api/billing/discount/validate") {
@@ -300,6 +300,7 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
       const now = Date.now();
       const items = rows.map(row => ({
         ...row,
+        subscription_duration_months: row.subscription_plan ? (PLAN_DURATIONS_MONTHS[row.subscription_plan] || null) : null,
         trial_active: Boolean(row.trial_started_at && row.trial_ends_at &&
           new Date(row.trial_started_at).getTime() <= now && new Date(row.trial_ends_at).getTime() > now),
         subscription_active: Boolean(row.subscription_started_at && row.subscription_ends_at &&
