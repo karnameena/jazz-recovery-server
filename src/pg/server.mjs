@@ -5,8 +5,11 @@ import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
 import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
+import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
+import { TRIAL_DAYS } from "./subscription-config.mjs";
 
 await applyMigrations();
+await ensureDefaultDiscountCodes(db);
 
 const port = Number(process.env.PORT || 8890);
 const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production" || String(process.env.RENDER || "").toLowerCase() === "true";
@@ -34,6 +37,14 @@ const dummyRecoveryPinHash = hashSecret("Jazz-Recovery-Dummy-PIN-Not-A-Valid-Rec
 const invalidDeviceAttempts = new Map();
 const deviceAuthCache = new Map();
 const dummyPasswordHash = hashSecret("Jazz-Lost-Mode-Dummy-Credential-Not-A-Login");
+
+function trialClaimHash(username) {
+  const normalized = String(username || "").trim().toLowerCase();
+  const pepper = String(process.env.JAZZ_TRIAL_CLAIM_PEPPER || "");
+  return pepper
+    ? crypto.createHmac("sha256", pepper).update(normalized).digest("hex")
+    : crypto.createHash("sha256").update(normalized).digest("hex");
+}
 
 function normalizeOrigin(value) {
   try {
@@ -617,6 +628,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (await handleBillingRoute({ req, res, path, db, json, readJson, requireSession })) return;
+
     if (req.method === "GET" && path === "/") {
       const nonce = crypto.randomBytes(18).toString("base64");
       return html(req, res, 200, serverHome(nonce), nonce);
@@ -666,14 +679,31 @@ const server = http.createServer(async (req, res) => {
           const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
+          let trialActivated = false;
+          let trialStartsAt = null;
+          let trialEndsAt = null;
+          if (TRIAL_DAYS > 0) {
+            const claim = await db.prepare("INSERT INTO billing_trial_claims(username_hash,user_id) VALUES(?,?) ON CONFLICT DO NOTHING RETURNING username_hash")
+              .get(trialClaimHash(username), user.id);
+            if (claim) {
+              const trial = await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + (? * INTERVAL '1 day')) RETURNING starts_at,expires_at")
+                .get(user.id, TRIAL_DAYS);
+              trialActivated = true;
+              trialStartsAt = trial.starts_at;
+              trialEndsAt = trial.expires_at;
+              await audit(user.id, null, "TRIAL_ACTIVATED", "SUCCESS");
+            }
+          }
           await audit(user.id, device.id, "DEVICE_REGISTER", "SUCCESS");
-          return { userId: user.id, deviceId: device.id };
+          return { userId: user.id, deviceId: device.id, trialActivated, trialStartsAt, trialEndsAt };
         });
         if (registered.conflict) return json(req, res, 409, { ok: false, error: registered.conflict });
         const session = await createSession(registered.userId);
         return json(req, res, 201, {
           ok: true,
           username,
+          trialActivated: registered.trialActivated,
+          trial: registered.trialActivated ? { startsAt: registered.trialStartsAt, expiresAt: registered.trialEndsAt } : null,
           device: { id: registered.deviceId, deviceId, deviceName, imei, deviceType: "Android" },
           expiresAt: session.expires
         }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
