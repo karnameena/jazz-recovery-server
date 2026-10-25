@@ -297,12 +297,24 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
           if (!Number.isInteger(durationMonths) || durationMonths < 1 || durationMonths > 120) {
             throw Object.assign(new Error("Subscription duration must be a whole number from 1 to 120 months."),{status:400});
           }
-          subscriptionEnd = new Date(subscriptionStart.getTime());
-          const originalDay = subscriptionEnd.getUTCDate();
-          subscriptionEnd.setUTCDate(1);
-          subscriptionEnd.setUTCMonth(subscriptionEnd.getUTCMonth() + durationMonths);
-          const lastDay = new Date(Date.UTC(subscriptionEnd.getUTCFullYear(),subscriptionEnd.getUTCMonth()+1,0)).getUTCDate();
-          subscriptionEnd.setUTCDate(Math.min(originalDay,lastDay));
+          if (body.subscriptionEndAt) {
+            subscriptionEnd = parseDate(body.subscriptionEndAt, "Subscription end");
+            if (subscriptionEnd <= subscriptionStart) throw Object.assign(new Error("Subscription end must be after subscription start."),{status:400});
+            let calendarMonths = (subscriptionEnd.getUTCFullYear()-subscriptionStart.getUTCFullYear())*12 + subscriptionEnd.getUTCMonth()-subscriptionStart.getUTCMonth();
+            const anchor = new Date(subscriptionStart.getTime());
+            const originalDay = anchor.getUTCDate();
+            anchor.setUTCDate(1);
+            anchor.setUTCMonth(anchor.getUTCMonth()+calendarMonths);
+            anchor.setUTCDate(Math.min(originalDay,new Date(Date.UTC(anchor.getUTCFullYear(),anchor.getUTCMonth()+1,0)).getUTCDate()));
+            durationMonths = Math.max(1,calendarMonths + (anchor.getTime() < subscriptionEnd.getTime() ? 1 : 0));
+          } else {
+            subscriptionEnd = new Date(subscriptionStart.getTime());
+            const originalDay = subscriptionEnd.getUTCDate();
+            subscriptionEnd.setUTCDate(1);
+            subscriptionEnd.setUTCMonth(subscriptionEnd.getUTCMonth() + durationMonths);
+            const lastDay = new Date(Date.UTC(subscriptionEnd.getUTCFullYear(),subscriptionEnd.getUTCMonth()+1,0)).getUTCDate();
+            subscriptionEnd.setUTCDate(Math.min(originalDay,lastDay));
+          }
         }
         await db.transaction(async () => {
           await db.prepare(
