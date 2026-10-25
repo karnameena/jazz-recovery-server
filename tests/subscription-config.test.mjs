@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TRIAL_DAYS, PLAN_CONFIG, PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS } from "../src/pg/subscription-config.mjs";
+import { TRIAL_DAYS, TRIAL_USERS, getTrialConfigForUsername, PLAN_CONFIG, PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS } from "../src/pg/subscription-config.mjs";
 import { planExpiry } from "../src/pg/billing.mjs";
 
 test("new eligible accounts receive a seven-day trial by default", () => {
@@ -20,4 +20,10 @@ test("configured monthly plan expiry handles short calendar months", () => {
 
 test("configured yearly plan expiry handles leap day", () => {
   assert.equal(planExpiry(Date.UTC(2024, 1, 29, 12), "annual").toISOString(), "2025-02-28T12:00:00.000Z");
+});
+
+test("per-user trial overrides are looked up case-insensitively and unlisted users use the default policy", () => {
+  assert.deepEqual(TRIAL_USERS, {});
+  assert.equal(getTrialConfigForUsername("new-user"), null);
+  assert.equal(getTrialConfigForUsername(" KARnameena1 "), null);
 });
