@@ -4,7 +4,7 @@ import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
-import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
+import { parsePhotoPayload, detectPhotoMimeType, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
 import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
 import { TRIAL_DAYS, getTrialConfigForUsername } from "./subscription-config.mjs";
 
@@ -1114,7 +1114,18 @@ const server = http.createServer(async (req, res) => {
           if (!candidate.length || candidate.length > 5 * 1024 * 1024) throw new Error("Current photo size is invalid");
           const declaredMime = state.photo_mime_type || object.ContentType ||
             (state.photo_object_key.endsWith(".png") ? "image/png" : "image/jpeg");
-          const parsed = parsePhotoPayload(candidate.toString("base64"), declaredMime);
+          const detectedMime = detectPhotoMimeType(candidate);
+          if (!detectedMime) throw new Error("Stored object is not a valid bounded JPEG/PNG image.");
+          // The bytes are authoritative. Stale database or object Content-Type metadata
+          // must not make an otherwise valid current photo impossible to display.
+          const parsed = parsePhotoPayload(candidate.toString("base64"), detectedMime);
+          if (declaredMime !== detectedMime) {
+            console.warn("[Jazz Lost Mode] Photo MIME metadata mismatch; serving validated image bytes.", {
+              deviceId: Number(photoContentMatch[1]),
+              storedMime: declaredMime,
+              detectedMime
+            });
+          }
           bytes = parsed.bytes;
           mimeType = parsed.mimeType;
         } else {
@@ -1125,8 +1136,38 @@ const server = http.createServer(async (req, res) => {
           mimeType = parsed.mimeType;
         }
       } catch (error) {
-        console.error("[Jazz Lost Mode] Current photo read/validation failed:", error?.name || "error");
-        return json(req, res, 502, { ok: false, error: "The current photo could not be read or is not a valid JPEG/PNG. Capture a new photo and try again." });
+        const errorName = String(error?.name || "Error").slice(0, 80);
+        const errorCode = String(error?.Code || error?.code || "").slice(0, 80);
+        const storageStatus = Number(error?.$metadata?.httpStatusCode) || null;
+        // Never log credentials, signed URLs, object bytes, or raw provider error messages.
+        console.error("[Jazz Lost Mode] Current photo read/validation failed:", {
+          deviceId: Number(photoContentMatch[1]),
+          errorName,
+          errorCode: errorCode || null,
+          storageStatus
+        });
+        const code = /NoSuchKey|NotFound|NoSuchBucket/i.test(errorCode)
+          ? "PHOTO_OBJECT_NOT_FOUND"
+          : /AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch|Forbidden/i.test(errorCode)
+            ? "PHOTO_STORAGE_ACCESS_DENIED"
+            : /Invalid current photo reference|Stored object is not a valid|Recovery photo must be|Recovery photo encoding/i.test(String(error?.message || ""))
+              ? "PHOTO_INVALID"
+              : /not configured|endpoint must use HTTPS/i.test(String(error?.message || ""))
+                ? "PHOTO_STORAGE_CONFIG"
+                : "PHOTO_STORAGE_UNAVAILABLE";
+        return json(req, res, 502, {
+          ok: false,
+          code,
+          error: code === "PHOTO_OBJECT_NOT_FOUND"
+            ? "The saved photo reference exists, but the image object could not be found in private storage. The current photo record was not deleted."
+            : code === "PHOTO_STORAGE_ACCESS_DENIED"
+              ? "The photo storage service denied access. Check the server's storage bucket permissions and credentials."
+              : code === "PHOTO_INVALID"
+                ? "The stored photo is not a valid JPEG or PNG. The existing photo record was not deleted."
+                : code === "PHOTO_STORAGE_CONFIG"
+                  ? "Private photo storage is not fully configured on this server."
+                  : "The private photo storage service could not return the saved image. Check the server logs for the safe diagnostic code."
+        });
       }
 
       applySecurityHeaders(req, res);
