@@ -1,4 +1,5 @@
 {
   "trialDays": 7,
-  "description": "New eligible accounts receive one 7-day trial. Per-user trial records are stored in PostgreSQL."
+  "description": "Default trial duration for eligible new users. User-specific date overrides are stored in the users map.",
+  "users": {}
 }
