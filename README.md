@@ -76,3 +76,35 @@ The design target is approximately 10,000 registered website users. This is a ta
 ## Security note
 
 This repository's older history may contain database artifacts. Removing a file from the current tree does not remove it from Git history. Review repository visibility and history exposure separately, and do not commit database backups, session cookies, tokens, credentials, locations, or recovery photos.
+
+
+## Permanent billing administrator and account recovery
+
+Billing-admin access is a PostgreSQL role in `billing_admins`; it is not a hard-coded username/password and is not stored in the website. The account password remains a salted password hash in `users`. Public first-time admin claiming is disabled. Ordinary visitors and subscribers never see the owner bootstrap form.
+
+Run these commands only from a trusted private terminal in the server checkout, with `DATABASE_URL` and `JAZZ_DB_ENGINE=postgres` configured for the intended database. In Render, use the deployed server's private Shell/one-off job after the relevant code has been deployed. Do not share the Neon connection string or any password.
+
+1. **Find the owner username and role**
+   ```powershell
+   npm run list-users
+   ```
+   This prints usernames and whether each account has billing-admin access. It never prints passwords or password hashes.
+
+2. **Recover or assign billing-admin access to an existing account**
+   ```powershell
+   npm run recover-billing-admin
+   ```
+   Enter the existing registered username. If a different billing admin already exists, the command requires the exact confirmation `REASSIGN BILLING ADMIN` before transferring the role. It changes only the rows in `billing_admins`; it does not delete users, paired devices, subscriptions, trials, locations, or photos. If the target already has the role, it makes no change.
+
+3. **If the password was forgotten**
+   ```powershell
+   npm run change-owner-password
+   ```
+   Enter the username and a new password when prompted. Password entry is hidden in an interactive terminal; password hashes are stored in PostgreSQL and existing sessions for that account are revoked. Do not pass the password as a command-line argument.
+
+4. **If there is no owner account yet**
+   First run `npm run list-users`. Only if you have confirmed that no suitable existing account exists, create one with `npm run create-owner`, then run `npm run recover-billing-admin` and assign the role to that account. Do not create a replacement account just because the password was forgotten; reset the existing account's password instead.
+
+The account and role persist across deployments because they are in PostgreSQL. Do not add an automatic owner-creation step to server startup, do not reset the database, and do not expose these recovery commands as public HTTP endpoints. Keep a securely stored copy of the owner username in a password manager. A password manager may also store the password; the application itself must never be able to reveal it later.
+
+Before production use, verify that the hosted API and website branches containing these changes have been reviewed, merged, and deployed. Do not run database recovery commands against Neon until you have verified which database the private terminal is configured to use.
