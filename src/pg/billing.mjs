@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS } from "./subscription-config.mjs";
+export { PLAN_PRICES_PAISE };
 function normalizePlan(value) {
   const plan = String(value || "annual").toLowerCase();
   if (!Object.hasOwn(PLAN_PRICES_PAISE, plan)) throw Object.assign(new Error("Choose a valid subscription plan."), { status: 400 });
