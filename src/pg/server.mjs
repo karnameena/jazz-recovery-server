@@ -693,7 +693,9 @@ const server = http.createServer(async (req, res) => {
                     .get(user.id, userTrialConfig.startsAt, userTrialConfig.endsAt)
                 : await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + (? * INTERVAL '1 day')) RETURNING starts_at,expires_at")
                     .get(user.id, TRIAL_DAYS);
-              trialActivated = true;
+              const nowMs = Date.now();
+              trialActivated = new Date(trial.starts_at).getTime() <= nowMs &&
+                new Date(trial.expires_at).getTime() > nowMs;
               trialStartsAt = trial.starts_at;
               trialEndsAt = trial.expires_at;
               await audit(user.id, null, "TRIAL_ACTIVATED", "SUCCESS");
