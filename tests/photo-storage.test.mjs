@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parsePhotoPayload, currentPhotoKey, shouldMigrateLegacyPhoto } from "../src/pg/photos.mjs";
+import { parsePhotoPayload, detectPhotoMimeType, currentPhotoKey, shouldMigrateLegacyPhoto } from "../src/pg/photos.mjs";
 
 const jpegFixture = () => Buffer.from([0xff,0xd8,0xff,...Array(18).fill(0),0xff,0xd9]);
 const pngFixture = () => Buffer.from([
@@ -8,6 +8,13 @@ const pngFixture = () => Buffer.from([
   ...Array(16).fill(0),
   0,0,0,0,73,69,78,68,174,66,96,130
 ]);
+
+test("photo MIME detection trusts validated image bytes rather than stale metadata", () => {
+  assert.equal(detectPhotoMimeType(jpegFixture()), "image/jpeg");
+  assert.equal(detectPhotoMimeType(pngFixture()), "image/png");
+  assert.equal(detectPhotoMimeType(Buffer.from("not an image")), null);
+  assert.equal(detectPhotoMimeType(Buffer.alloc(5 * 1024 * 1024 + 1)), null);
+});
 
 test("photo payload accepts JPEG and PNG with matching MIME and intact boundaries", () => {
   assert.equal(parsePhotoPayload(jpegFixture().toString("base64"), "image/jpeg").mimeType, "image/jpeg");
