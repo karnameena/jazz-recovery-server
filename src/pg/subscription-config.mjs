@@ -43,8 +43,8 @@ const configuredTrials = normalizeTrialUsers(trial.users);
 if (!subscription.plans || !subscription.plans.monthly || !subscription.plans.annual) throw new Error("subscription-config.json must define monthly and annual plans.");
 for (const name of ["monthly", "annual"]) {
   const plan = subscription.plans[name];
-  if (!Number.isSafeInteger(plan.pricePaise) || plan.pricePaise < 0 || !Number.isInteger(plan.durationMonths) || plan.durationMonths < 1 || plan.durationMonths > 120) {
-    throw new Error(`subscription-config.json has invalid ${name} plan settings.`);
+  if (!Number.isSafeInteger(plan.pricePaise) || plan.pricePaise < 0 || !Number.isInteger(plan.durationMonths) || plan.durationMonths < 1 || plan.durationMonths > 120 || typeof plan.label !== "string" || !plan.label.trim() || typeof plan.periodLabel !== "string" || !plan.periodLabel.trim()) {
+    throw new Error(`subscription-config.json has invalid ${name} plan settings; check pricePaise, durationMonths, label, and periodLabel.`);
   }
 }
 export const TRIAL_DAYS = trial.trialDays;
