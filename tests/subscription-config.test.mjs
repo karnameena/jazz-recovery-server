@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TRIAL_DAYS, TRIAL_USERS, getTrialConfigForUsername, PLAN_CONFIG, PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS } from "../src/pg/subscription-config.mjs";
+import { TRIAL_DAYS, TRIAL_USERS, getTrialConfigForUsername, normalizeTrialUsers, PLAN_CONFIG, PLAN_PRICES_PAISE, PLAN_DURATIONS_MONTHS } from "../src/pg/subscription-config.mjs";
 import { planExpiry } from "../src/pg/billing.mjs";
 
 test("new eligible accounts receive a seven-day trial by default", () => {
@@ -26,4 +26,31 @@ test("per-user trial overrides are looked up case-insensitively and unlisted use
   assert.deepEqual(TRIAL_USERS, {});
   assert.equal(getTrialConfigForUsername("new-user"), null);
   assert.equal(getTrialConfigForUsername(" KARnameena1 "), null);
+});
+
+test("manual per-user trial dates normalize timezone offsets and match usernames case-insensitively", () => {
+  const users = normalizeTrialUsers({
+    "karnameena1": {
+      enabled: true,
+      startDate: "2026-10-25T00:00:00+05:30",
+      endDate: "2026-11-01T23:59:59+05:30",
+      description: "Manually managed trial period"
+    }
+  });
+  assert.deepEqual(users.karnameena1, {
+    enabled: true,
+    startsAt: "2026-10-24T18:30:00.000Z",
+    endsAt: "2026-11-01T18:29:59.000Z",
+    description: "Manually managed trial period"
+  });
+  assert.equal(normalizeTrialUsers({}).karnameena1, undefined);
+});
+
+test("manual per-user trial dates reject missing timezone offsets and invalid date ranges", () => {
+  assert.throws(() => normalizeTrialUsers({
+    user_one: { enabled: true, startDate: "2026-10-25T00:00:00", endDate: "2026-11-01T23:59:59+05:30", description: "" }
+  }), /timezone offset/);
+  assert.throws(() => normalizeTrialUsers({
+    user_one: { enabled: true, startDate: "2026-11-02T00:00:00+05:30", endDate: "2026-11-01T23:59:59+05:30", description: "" }
+  }), /endDate after startDate/);
 });
