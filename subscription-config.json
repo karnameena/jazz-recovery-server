@@ -1,0 +1,16 @@
+{
+  "currency": "INR",
+  "plans": {
+    "monthly": {
+      "pricePaise": 4900,
+      "durationMonths": 1,
+      "label": "Monthly"
+    },
+    "annual": {
+      "pricePaise": 39900,
+      "durationMonths": 12,
+      "label": "Yearly"
+    }
+  },
+  "description": "Pricing and duration policy only. Per-user subscriptions and activation timestamps are stored in PostgreSQL."
+}
