@@ -1262,13 +1262,30 @@ const server = http.createServer(async (req, res) => {
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       await expireLocationCommands(row.id);
       const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(locationResultMatch[2], row.id);
-      if (!command || !LOCATION_COMMANDS.has(command.type)) return json(req, res, 404, { ok: false, error: "Command not found" });
+      if (!command || (!LOCATION_COMMANDS.has(command.type) && command.type !== "recovery_photo")) {
+        return json(req, res, 404, { ok: false, error: "Command not found" });
+      }
       const outcome = command.result_json ? JSON.parse(command.result_json) : null;
+      const state = await stateFor(row.id);
+      if (command.type === "recovery_photo") {
+        const status = command.status === "expired" ? "EXPIRED" :
+          command.status === "done" ? (outcome?.ok === true ? "COMPLETED" : "FAILED") :
+          state?.online ? "PENDING" : "DEVICE_OFFLINE";
+        return json(req, res, 200, {
+          ok: true,
+          commandId: command.id,
+          command: command.type,
+          status,
+          photoAvailable: status === "COMPLETED",
+          result: outcome,
+          createdAt: databaseUtcToIso(command.created_at),
+          completedAt: databaseUtcToIso(command.completed_at)
+        });
+      }
       const desired = command.type === "location_enable" ? "ON" : command.type === "location_disable" ? "OFF" : null;
       const confirmed = command.status === "done" && outcome?.ok === true &&
         (desired ? outcome.confirmed === true && outcome.locationServices === desired :
           ["ON","OFF"].includes(outcome.locationServices));
-      const state = await stateFor(row.id);
       const status = confirmed ? "CONFIRMED" :
         command.status === "expired" ? "EXPIRED" :
         command.status === "done" ? "FAILED" :
