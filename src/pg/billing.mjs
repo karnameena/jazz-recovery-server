@@ -250,9 +250,15 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
   }
 
   if (req.method === "POST" && path === "/api/billing/admin/claim") {
-    const bootstrap = String(process.env.JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET || "");
-    const supplied = String((await jsonBody(req,readJson)).bootstrapSecret || "");
-    if (!bootstrap || !safeEqual(supplied,bootstrap)) return reply(req,res,403,{ok:false,error:"Invalid admin bootstrap secret"},json);
+    // Trim accidental copy/paste whitespace, but never log or return either secret.
+    const bootstrap = String(process.env.JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET || "").trim();
+    const supplied = String((await jsonBody(req,readJson)).bootstrapSecret || "").trim();
+    if (!bootstrap) {
+      return reply(req,res,503,{ok:false,error:"Billing admin bootstrap secret is missing from the running API environment. Set JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET in this backend's .env and restart this API process."},json);
+    }
+    if (!safeEqual(supplied,bootstrap)) {
+      return reply(req,res,403,{ok:false,error:"Bootstrap secret mismatch. The secret loaded by the API process does not match the submitted value. Verify the backend process/port, then restart that API after saving .env."},json);
+    }
     try {
       await db.transaction(async () => {
         await db.prepare("SELECT pg_advisory_xact_lock(7482362)").get();
