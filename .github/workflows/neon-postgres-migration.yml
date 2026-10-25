@@ -36,6 +36,8 @@ jobs:
           node --check src/entrypoint.mjs
           node --check src/pg/database.mjs
           node --check src/pg/server.mjs
+          node --check src/pg/billing.mjs
+          node --check src/pg/subscription-config.mjs
           node --check src/pg/photos.mjs
           node --check tests/photo-storage.test.mjs
           node --check src/pg/sessions.mjs
@@ -47,5 +49,7 @@ jobs:
           node --check tests/postgres-only-runtime.test.mjs
       - name: Enforce PostgreSQL-only runtime and administration
         run: node --test tests/postgres-only-runtime.test.mjs tests/photo-storage.test.mjs
+      - name: Validate trial and subscription configuration
+        run: node --test tests/subscription-config.test.mjs tests/subscription-plans.test.mjs
       - name: PostgreSQL-backed recovery workflow integration test
         run: node --test tests/postgres-migration.test.mjs
