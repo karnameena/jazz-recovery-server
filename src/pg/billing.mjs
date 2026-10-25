@@ -273,6 +273,30 @@ export async function handleBillingRoute({ req, res, path, db, json, readJson, r
 
   if (path.startsWith("/api/billing/admin/")) {
     if (!(await adminCheck(userId,db))) return reply(req,res,403,{ok:false,error:"Owner/admin access required"},json);
+    if (req.method === "GET" && path === "/api/billing/admin/user-ledger") {
+      // User-specific entitlement records live in PostgreSQL, never in tracked JSON config.
+      // Return each user trial and every subscription record without exposing secrets or payment tokens.
+      const rows = await db.prepare([
+        "SELECT u.username, t.starts_at AS trial_started_at, t.expires_at AS trial_ends_at, " +
+        "s.id AS subscription_id, s.plan_type AS subscription_plan, s.status AS subscription_status, " +
+        "s.starts_at AS subscription_started_at, s.expires_at AS subscription_ends_at, " +
+        "s.amount_paid_paise, s.created_at AS subscription_recorded_at " +
+        "FROM public.users AS u " +
+        "LEFT JOIN public.billing_trials AS t ON t.user_id = u.id " +
+        "LEFT JOIN public.billing_subscriptions AS s ON s.user_id = u.id " +
+        "ORDER BY LOWER(u.username), s.created_at DESC NULLS LAST, s.id DESC NULLS LAST LIMIT 20000"
+      ].join("")).all();
+      const now = Date.now();
+      const items = rows.map(row => ({
+        ...row,
+        trial_active: Boolean(row.trial_started_at && row.trial_ends_at &&
+          new Date(row.trial_started_at).getTime() <= now && new Date(row.trial_ends_at).getTime() > now),
+        subscription_active: Boolean(row.subscription_started_at && row.subscription_ends_at &&
+          ["active", "complimentary"].includes(String(row.subscription_status)) &&
+          new Date(row.subscription_started_at).getTime() <= now && new Date(row.subscription_ends_at).getTime() > now)
+      }));
+      return reply(req,res,200,{ok:true,items},json);
+    }
     if (req.method === "GET" && path === "/api/billing/admin/discount-codes") {
       const rows = await db.prepare("SELECT id,label,percent_off,active,starts_at,expires_at,max_redemptions,redeemed_count,eligible_plan,per_user_limit,created_at,updated_at FROM billing_discount_codes ORDER BY created_at DESC").all();
       return reply(req,res,200,{ok:true,items:rows},json);
