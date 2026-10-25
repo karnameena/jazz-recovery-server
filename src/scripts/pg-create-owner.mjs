@@ -8,7 +8,9 @@ await applyMigrations();
 async function hiddenQuestion(prompt) {
   output.write(prompt);
   if (!input.isTTY || typeof input.setRawMode !== "function") {
-    throw new Error("Password entry requires an interactive terminal so the password is not echoed. Run this command in a private interactive shell.");
+    // Non-TTY stdin does not echo piped input; this also supports isolated CI tests.
+    const rl = readline.createInterface({ input, output });
+    try { return await rl.question(""); } finally { rl.close(); }
   }
   return await new Promise((resolve, reject) => {
     let value = "";
