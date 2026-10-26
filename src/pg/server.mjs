@@ -612,6 +612,7 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
       durationMs: Date.now() - uploadStartedAt
     }));
   } catch (error) {
+    const storageCode = String(error?.code || error?.Code || error?.name || "UNKNOWN").slice(0, 64);
     console.error("[Jazz Recovery Photo]", JSON.stringify({
       stage: "object_upload_failed",
       commandId: command.id,
@@ -619,8 +620,23 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
       sizeBytes: parsed.bytes.length,
       durationMs: Date.now() - uploadStartedAt,
       errorName: error?.name || "Error",
-      errorCode: String(error?.code || error?.Code || "UNKNOWN").slice(0, 64)
+      errorCode: storageCode
     }));
+    const permanentStorageFailure =
+      /not configured|must use HTTPS|NoSuchBucket|AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch|InvalidEndpoint/i
+        .test(`${storageCode} ${String(error?.message || "")}`);
+    if (permanentStorageFailure) {
+      const safeError = "Private photo storage is not configured correctly or the server cannot access it. Check the server's private storage settings.";
+      await db.transaction(async () => {
+        await db.lockDevice(device.id);
+        await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
+          .run(JSON.stringify({ ok: false, code: "PHOTO_STORAGE_CONFIG", error: safeError }), command.id);
+        await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_STORAGE");
+      });
+      return { status: 200, body: { ok: true, photoAvailable: false, code: "PHOTO_STORAGE_CONFIG", error: safeError } };
+    }
+    // Leave transient storage/network failures retryable. The Android companion
+    // has durably queued the exact captured payload and will retry this command ID.
     throw error;
   }
   let outcome;
