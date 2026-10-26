@@ -905,7 +905,7 @@ const server = http.createServer(async (req, res) => {
     // Read command status for any owner-authorized recovery action.
     // Location toggles require state confirmation; photo and other actions require
     // an acknowledged successful device result. Never return another owner's command.
-    const commandResultMatch = path.match(/^\\/api\\/devices\\/(\\d+)\\/commands\\/([a-f0-9-]{36})$/i);
+    const commandResultMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
     if (req.method === "GET" && commandResultMatch) {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, commandResultMatch[1]);
