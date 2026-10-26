@@ -5,8 +5,11 @@ import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
 import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
+import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
+import { TRIAL_DAYS, getTrialConfigForUsername } from "./subscription-config.mjs";
 
 await applyMigrations();
+await ensureDefaultDiscountCodes(db);
 
 const port = Number(process.env.PORT || 8890);
 const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production" || String(process.env.RENDER || "").toLowerCase() === "true";
@@ -34,6 +37,14 @@ const dummyRecoveryPinHash = hashSecret("Jazz-Recovery-Dummy-PIN-Not-A-Valid-Rec
 const invalidDeviceAttempts = new Map();
 const deviceAuthCache = new Map();
 const dummyPasswordHash = hashSecret("Jazz-Lost-Mode-Dummy-Credential-Not-A-Login");
+
+function trialClaimHash(username) {
+  const normalized = String(username || "").trim().toLowerCase();
+  const pepper = String(process.env.JAZZ_TRIAL_CLAIM_PEPPER || "");
+  return pepper
+    ? crypto.createHmac("sha256", pepper).update(normalized).digest("hex")
+    : crypto.createHash("sha256").update(normalized).digest("hex");
+}
 
 function normalizeOrigin(value) {
   try {
@@ -517,14 +528,28 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
   if (command.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
 
+  const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
   if (result.ok !== true || typeof result.imageBase64 !== "string") {
+    const detail = String(result.error || result.status || "Photo capture failed")
+      .replace(/[\\r\\n]+/g, " ").slice(0, 160);
     await db.transaction(async () => {
       await db.lockDevice(device.id);
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
-        .run(JSON.stringify({ ok: false, error: "Photo capture failed" }), command.id);
+        .run(JSON.stringify({ ok: false, error: detail, camera: requestedCamera }), command.id);
       await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAPTURE");
     });
-    return { status: 200, body: { ok: true, photoAvailable: false } };
+    return { status: 200, body: { ok: true, photoAvailable: false, error: detail } };
+  }
+
+  if (result.camera !== requestedCamera) {
+    const detail = "Captured camera does not match the requested camera";
+    await db.transaction(async () => {
+      await db.lockDevice(device.id);
+      await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
+        .run(JSON.stringify({ ok: false, error: detail, camera: result.camera || null }), command.id);
+      await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAMERA_MISMATCH");
+    });
+    return { status: 200, body: { ok: true, photoAvailable: false, error: detail } };
   }
 
   if (!photoStorageConfigured()) {
@@ -617,6 +642,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (await handleBillingRoute({ req, res, path, db, json, readJson, requireSession })) return;
+
     if (req.method === "GET" && path === "/") {
       const nonce = crypto.randomBytes(18).toString("base64");
       return html(req, res, 200, serverHome(nonce), nonce);
@@ -666,14 +693,38 @@ const server = http.createServer(async (req, res) => {
           const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
+          let trialActivated = false;
+          let trialStartsAt = null;
+          let trialEndsAt = null;
+          const userTrialConfig = getTrialConfigForUsername(username);
+          const trialEnabled = userTrialConfig ? userTrialConfig.enabled : TRIAL_DAYS > 0;
+          if (trialEnabled) {
+            const claim = await db.prepare("INSERT INTO billing_trial_claims(username_hash,user_id) VALUES(?,?) ON CONFLICT DO NOTHING RETURNING username_hash")
+              .get(trialClaimHash(username), user.id);
+            if (claim) {
+              const trial = userTrialConfig
+                ? await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,?,?) RETURNING starts_at,expires_at")
+                    .get(user.id, userTrialConfig.startsAt, userTrialConfig.endsAt)
+                : await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + (? * INTERVAL '1 day')) RETURNING starts_at,expires_at")
+                    .get(user.id, TRIAL_DAYS);
+              const nowMs = Date.now();
+              trialActivated = new Date(trial.starts_at).getTime() <= nowMs &&
+                new Date(trial.expires_at).getTime() > nowMs;
+              trialStartsAt = trial.starts_at;
+              trialEndsAt = trial.expires_at;
+              await audit(user.id, null, "TRIAL_ACTIVATED", "SUCCESS");
+            }
+          }
           await audit(user.id, device.id, "DEVICE_REGISTER", "SUCCESS");
-          return { userId: user.id, deviceId: device.id };
+          return { userId: user.id, deviceId: device.id, trialActivated, trialStartsAt, trialEndsAt };
         });
         if (registered.conflict) return json(req, res, 409, { ok: false, error: registered.conflict });
         const session = await createSession(registered.userId);
         return json(req, res, 201, {
           ok: true,
           username,
+          trialActivated: registered.trialActivated,
+          trial: registered.trialActivated ? { startsAt: registered.trialStartsAt, expiresAt: registered.trialEndsAt } : null,
           device: { id: registered.deviceId, deviceId, deviceName, imei, deviceType: "Android" },
           expiresAt: session.expires
         }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
@@ -1175,30 +1226,41 @@ const server = http.createServer(async (req, res) => {
       return json(req, res, response.status, response.body, response.headers || {});
     }
 
-    // Result is read only by the authenticated owner of the enrolled device.
-    // Browser never treats HTTP 202 queue acceptance as a successful toggle.
-    const locationResultMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
-    if (req.method === "GET" && locationResultMatch) {
+    // Command status is readable only by the authenticated owner of the enrolled device.
+    // Support every command type; the former location-only guard returned 404 for photo commands.
+    const commandStatusMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
+    if (req.method === "GET" && commandStatusMatch) {
       const session = await requireSession(req, res); if (!session) return;
-      const row = await ownerDevice(session.user_id, locationResultMatch[1]);
+      const row = await ownerDevice(session.user_id, commandStatusMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
-      await expireLocationCommands(row.id);
-      const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(locationResultMatch[2], row.id);
-      if (!command || !LOCATION_COMMANDS.has(command.type)) return json(req, res, 404, { ok: false, error: "Command not found" });
-      const outcome = command.result_json ? JSON.parse(command.result_json) : null;
-      const desired = command.type === "location_enable" ? "ON" : command.type === "location_disable" ? "OFF" : null;
-      const confirmed = command.status === "done" && outcome?.ok === true &&
+      const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?")
+        .get(commandStatusMatch[2], row.id);
+      if (!command) return json(req, res, 404, { ok: false, error: "Command not found" });
+      if (LOCATION_COMMANDS.has(command.type)) await expireLocationCommands(row.id);
+      const refreshed = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?")
+        .get(command.id, row.id);
+      if (!refreshed) return json(req, res, 404, { ok: false, error: "Command not found" });
+      const outcome = refreshed.result_json ? JSON.parse(refreshed.result_json) : null;
+      const desired = refreshed.type === "location_enable" ? "ON" :
+        refreshed.type === "location_disable" ? "OFF" : null;
+      const confirmed = LOCATION_COMMANDS.has(refreshed.type) &&
+        refreshed.status === "done" && outcome?.ok === true &&
         (desired ? outcome.confirmed === true && outcome.locationServices === desired :
-          ["ON","OFF"].includes(outcome.locationServices));
+          ["ON", "OFF"].includes(outcome.locationServices));
       const state = await stateFor(row.id);
-      const status = confirmed ? "CONFIRMED" :
-        command.status === "expired" ? "EXPIRED" :
-        command.status === "done" ? "FAILED" :
-        state?.online ? "PENDING" : "DEVICE_OFFLINE";
-      return json(req, res, 200, { ok: true, commandId: command.id, status,
-        confirmed, command: command.type, result: outcome,
-        createdAt: databaseUtcToIso(command.created_at),
-        completedAt: databaseUtcToIso(command.completed_at) });
+      const status = LOCATION_COMMANDS.has(refreshed.type)
+        ? (confirmed ? "CONFIRMED" :
+            refreshed.status === "expired" ? "EXPIRED" :
+            refreshed.status === "done" ? "FAILED" :
+            state?.online ? "PENDING" : "DEVICE_OFFLINE")
+        : (refreshed.status === "expired" ? "EXPIRED" :
+            refreshed.status === "done" ? (outcome?.ok === false ? "FAILED" : "COMPLETE") :
+            state?.online ? "PENDING" : "DEVICE_OFFLINE");
+      // Never return photo bytes through status polling. Photo results contain metadata only.
+      return json(req, res, 200, { ok: true, commandId: refreshed.id, status,
+        confirmed, command: refreshed.type, result: outcome,
+        createdAt: databaseUtcToIso(refreshed.created_at),
+        completedAt: databaseUtcToIso(refreshed.completed_at) });
     }
 
     const auditMatch = path.match(/^\/api\/devices\/(\d+)\/audit$/);

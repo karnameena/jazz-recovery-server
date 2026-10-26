@@ -1,0 +1,5 @@
+{
+  "trialDays": 7,
+  "description": "Default trial duration for eligible new users. User-specific date overrides are stored in the users map.",
+  "users": {}
+}
