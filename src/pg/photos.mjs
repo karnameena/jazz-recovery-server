@@ -107,8 +107,3 @@ export async function deletePhotoFile(key) {
   await fs.rm(absolutePhotoPath(key), { force: true });
 }
 
-export async function localPhotoUrl(key, { download = false } = {}) {
-  const safeKey = safeRelativeKey(key);
-  const deviceId = safeKey.split("/")[1];
-  return `/api/devices/${deviceId}/photo-content${download ? "?download=1" : ""}`;
-}
