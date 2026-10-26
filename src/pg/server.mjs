@@ -532,7 +532,19 @@ async function cleanupUploadedPhotoIfUnreferenced(key) {
 async function completeRecoveryPhotoResult(device, commandId, result) {
   const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(commandId, device.id);
   if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
-  if (command.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
+  if (command.status === "done") {
+    const previous = command.result_json ? JSON.parse(command.result_json) : null;
+    const saved = previous?.ok === true;
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        deduplicated: true,
+        photoAvailable: saved,
+        ...(saved ? {} : { error: previous?.error || "The earlier photo request did not save an image." })
+      }
+    };
+  }
 
   if (result.ok !== true || typeof result.imageBase64 !== "string") {
     await db.transaction(async () => {
@@ -568,8 +580,36 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   }
 
   const key = currentPhotoKey(device.id, command.id, parsed.extension);
-  await uploadPhotoObject({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
+  const uploadStartedAt = Date.now();
+  console.info("[Jazz Recovery Photo]", JSON.stringify({
+    stage: "object_upload_started",
+    commandId: command.id,
+    deviceId: device.id,
+    sizeBytes: parsed.bytes.length
+  }));
+  try {
+    await uploadPhotoObject({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
+    console.info("[Jazz Recovery Photo]", JSON.stringify({
+      stage: "object_upload_completed",
+      commandId: command.id,
+      deviceId: device.id,
+      sizeBytes: parsed.bytes.length,
+      durationMs: Date.now() - uploadStartedAt
+    }));
+  } catch (error) {
+    console.error("[Jazz Recovery Photo]", JSON.stringify({
+      stage: "object_upload_failed",
+      commandId: command.id,
+      deviceId: device.id,
+      sizeBytes: parsed.bytes.length,
+      durationMs: Date.now() - uploadStartedAt,
+      errorName: error?.name || "Error",
+      errorCode: String(error?.code || error?.Code || "UNKNOWN").slice(0, 64)
+    }));
+    throw error;
+  }
   let outcome;
+  const persistenceStartedAt = Date.now();
   try {
     outcome = await db.transaction(async () => {
       await db.lockDevice(device.id);
@@ -593,9 +633,16 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
     throw error;
   }
 
+  console.info("[Jazz Recovery Photo]", JSON.stringify({
+    stage: "postgres_persistence_completed",
+    commandId: command.id,
+    deviceId: device.id,
+    deduplicated: outcome.deduplicated === true,
+    durationMs: Date.now() - persistenceStartedAt
+  }));
   if (outcome.deduplicated) {
     if (outcome.currentKey !== key) await cleanupUploadedPhotoIfUnreferenced(key);
-    return { status: 200, body: { ok: true, deduplicated: true } };
+    return { status: 200, body: { ok: true, deduplicated: true, photoAvailable: Boolean(outcome.currentKey) } };
   }
   void processPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup retry failed:", error?.name || "error"));
   return { status: 200, body: { ok: true, photoAvailable: true } };
