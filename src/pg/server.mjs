@@ -499,7 +499,7 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   }
 }
 
-const server = http.createServerconst server = http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const path = url.pathname;
   const browserOrigin = req.headers.origin ? normalizeOrigin(req.headers.origin) : null;
