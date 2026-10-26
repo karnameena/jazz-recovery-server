@@ -167,6 +167,37 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     assert.equal(ring.status,202,"Existing ring feature still queues");
     const photo=await api("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},sessionHeaders);
     assert.equal(photo.status,202,"Existing photo feature still queues");
+
+    // Verify successful upload -> PostgreSQL commit -> authenticated photo read-back.
+    // The fixture is deliberately tiny but has the JPEG boundary bytes validated by the API.
+    const verifiedJpeg = Buffer.from([0xff,0xd8,0xff,...Array(18).fill(0),0xff,0xd9]);
+    const photoResult = await api("POST","/android/device/commands/"+photo.data.commandId+"/result",{
+      deviceId:"existing-phone",
+      result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:verifiedJpeg.toString("base64"),timestamp:Date.now()}
+    },deviceHeaders);
+    assert.equal(photoResult.status,200,"Valid recovery photo upload must be accepted");
+    assert.equal(photoResult.data.photoAvailable,true,"Photo success is returned only after database read-back verification");
+    const photoBytesResponse = await fetch(base+"/api/devices/"+id+"/photo-content",{headers:sessionHeaders,cache:"no-store"});
+    assert.equal(photoBytesResponse.status,200,"Owner must read back the saved current photo");
+    assert.equal(photoBytesResponse.headers.get("content-type"),"image/jpeg");
+    assert.deepEqual(Buffer.from(await photoBytesResponse.arrayBuffer()),verifiedJpeg,"Read-back bytes must match the latest successful upload exactly");
+
+    // A malformed replacement must fail validation without changing the committed photo.
+    const failedReplacement = await api("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},sessionHeaders);
+    assert.equal(failedReplacement.status,202);
+    const failedPhotoResult = await api("POST","/android/device/commands/"+failedReplacement.data.commandId+"/result",{
+      deviceId:"existing-phone",
+      result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:"not-valid-base64",timestamp:Date.now()}
+    },deviceHeaders);
+    assert.equal(failedPhotoResult.status,200,"Capture-validation failure is recorded as a completed command");
+    assert.equal(failedPhotoResult.data.photoAvailable,false,"Invalid replacement must not be reported as available");
+    const preservedPhotoResponse = await fetch(base+"/api/devices/"+id+"/photo-content",{headers:sessionHeaders,cache:"no-store"});
+    assert.equal(preservedPhotoResponse.status,200,"Previous verified photo must remain readable after failed replacement");
+    assert.deepEqual(Buffer.from(await preservedPhotoResponse.arrayBuffer()),verifiedJpeg,"Failed replacement must preserve previous photo bytes");
+    const storedPhoto = await pool.query("SELECT photo_data_url,photo_mime_type,photo_size_bytes FROM device_state WHERE device_id=$1",[deviceDbId]);
+    assert.equal(storedPhoto.rows[0].photo_data_url,"data:image/jpeg;base64,"+verifiedJpeg.toString("base64"));
+    assert.equal(storedPhoto.rows[0].photo_mime_type,"image/jpeg");
+    assert.equal(Number(storedPhoto.rows[0].photo_size_bytes),verifiedJpeg.length);
     const voiceAudio = Buffer.alloc(46);
     voiceAudio.write("RIFF",0,"ascii");voiceAudio.write("WAVE",8,"ascii");
     voiceAudio.writeUInt16LE(1,20);voiceAudio.writeUInt16LE(1,22);
