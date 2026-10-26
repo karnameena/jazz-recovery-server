@@ -110,15 +110,21 @@ class HttpError extends Error {
 function readJson(req, maxBytes = 2 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let raw = "";
+    let receivedBytes = 0;
     let tooLarge = false;
     req.setEncoding("utf8");
     req.on("data", chunk => {
       if (tooLarge) return;
-      raw += chunk;
-      if (Buffer.byteLength(raw) > maxBytes) {
+      // Count only the incoming chunk. Re-measuring the entire accumulated
+      // photo JSON on every data event repeatedly scans megabytes of text and
+      // can make Base64 uploads unnecessarily CPU-expensive.
+      receivedBytes += Buffer.byteLength(chunk, "utf8");
+      if (receivedBytes > maxBytes) {
         tooLarge = true;
         raw = "";
+        return;
       }
+      raw += chunk;
     });
     req.on("end", () => {
       if (tooLarge) return reject(new HttpError(413, "Request too large"));
