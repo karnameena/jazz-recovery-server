@@ -18,9 +18,7 @@
     "node": ">=22.5.0"
   },
   "dependencies": {
-    "pg": "^8.16.3",
     "@simplewebauthn/server": "^13.2.2",
-    "@aws-sdk/client-s3": "^3.850.0",
-    "@aws-sdk/s3-request-presigner": "^3.850.0"
+    "pg": "^8.16.3"
   }
 }
