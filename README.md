@@ -13,7 +13,7 @@ Jazz Recovery's hosted API uses **Neon PostgreSQL as its only runtime database**
 
 ## Persistent data
 
-Neon PostgreSQL stores user accounts and password hashes, recovery PIN hashes, sessions, passkey credentials and one-time WebAuthn challenges, paired devices and credential hashes, IMEI, device state, latest location and photo metadata/path, recovery commands, and audit records. The photo bytes themselves are stored as one current file per device on the API host's persistent local disk; AWS S3 and AWS storage credentials are not used.
+Neon PostgreSQL stores user accounts and password hashes, recovery PIN hashes, sessions, passkey credentials and one-time WebAuthn challenges, paired devices and credential hashes, IMEI, device state, latest location and the current recovery photo bytes plus metadata, recovery commands, and audit records. The current recovery photo bytes are stored directly in Neon PostgreSQL as a single current data URL per device. A new photo is validated, written and read back inside a PostgreSQL transaction before commit; any failure rolls back and preserves the previous photo. Replacing the current photo overwrites its prior value, so no photo history is retained. No AWS S3, object storage, signed object URLs, or local photo-file storage is used.
 
 Passkey verification requires the public website origin to match `JAZZ_WEBAUTHN_ORIGIN`; `JAZZ_WEBAUTHN_RP_ID` must be that website's hostname. Keep these values aligned with the HTTPS website users actually open.
 
@@ -31,9 +31,8 @@ Set these values in the private Render environment (do not commit secrets):
 | `LOST_MODE_TRUST_PROXY` | `true` when behind the trusted Render proxy |
 | `JAZZ_WEBAUTHN_ORIGIN` | Exact HTTPS website origin for passkeys |
 | `JAZZ_WEBAUTHN_RP_ID` | Hostname of that website, without scheme or path |
-| `JAZZ_PHOTO_DIR` | Absolute path to a persistent local directory for current recovery photos; required in production |
 
-Render provides `PORT`. The checked-in `render.yaml` is a staging/proposal configuration; do not deploy it to production without reviewing the service settings and explicitly approving the cutover. Recovery photos require a persistent mounted disk at `JAZZ_PHOTO_DIR`; an ephemeral free-tier filesystem can lose photos on restart/redeploy and must not be treated as durable storage.
+Render provides `PORT`. The checked-in `render.yaml` is a staging/proposal configuration; do not deploy it to production without reviewing the service settings and explicitly approving the cutover. Photo bytes persist in Neon PostgreSQL, not the server filesystem.
 
 ## Account recovery endpoints
 
