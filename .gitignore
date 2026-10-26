@@ -24,5 +24,3 @@ Thumbs.db
 .neon
 .neon/
 
-# Current recovery photos are private local runtime files; never commit them.
-var/photos/
