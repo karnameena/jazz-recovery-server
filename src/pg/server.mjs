@@ -4,7 +4,7 @@ import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
-import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
+import { parsePhotoPayload, detectPhotoMimeType, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
 import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
 import { TRIAL_DAYS, getTrialConfigForUsername } from "./subscription-config.mjs";
 
@@ -110,15 +110,21 @@ class HttpError extends Error {
 function readJson(req, maxBytes = 2 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let raw = "";
+    let receivedBytes = 0;
     let tooLarge = false;
     req.setEncoding("utf8");
     req.on("data", chunk => {
       if (tooLarge) return;
-      raw += chunk;
-      if (Buffer.byteLength(raw) > maxBytes) {
+      // Count only the incoming chunk. Re-measuring the entire accumulated
+      // photo JSON on every data event repeatedly scans megabytes of text and
+      // can make Base64 uploads unnecessarily CPU-expensive.
+      receivedBytes += Buffer.byteLength(chunk, "utf8");
+      if (receivedBytes > maxBytes) {
         tooLarge = true;
         raw = "";
+        return;
       }
+      raw += chunk;
     });
     req.on("end", () => {
       if (tooLarge) return reject(new HttpError(413, "Request too large"));
@@ -526,16 +532,43 @@ async function cleanupUploadedPhotoIfUnreferenced(key) {
 async function completeRecoveryPhotoResult(device, commandId, result) {
   const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(commandId, device.id);
   if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
-  if (command.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
+  if (command.status === "done") {
+    const previous = command.result_json ? JSON.parse(command.result_json) : null;
+    const saved = previous?.ok === true;
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        deduplicated: true,
+        photoAvailable: saved,
+        ...(saved ? {} : { error: previous?.error || "The earlier photo request did not save an image." })
+      }
+    };
+  }
 
   if (result.ok !== true || typeof result.imageBase64 !== "string") {
+    const code = String(result.status || "CAMERA_CAPTURE_FAILED")
+      .toUpperCase().replace(/[^A-Z0-9_]/g, "").slice(0, 64) || "CAMERA_CAPTURE_FAILED";
+    const knownMessages = {
+      CAMERA_PERMISSION_REQUIRED: "Camera permission is unavailable on the phone.",
+      CAMERA_CAPTURE_TIMEOUT_OR_OS_BLOCKED: "Camera capture timed out or Android blocked camera access.",
+      CAMERA_CAPTURE_OS_BLOCKED: "Android blocked camera access in the current device state.",
+      CAMERA_CAPTURE_FAILED: "The phone could not capture a photo."
+    };
+    const safeError = knownMessages[code] || knownMessages.CAMERA_CAPTURE_FAILED;
+    console.warn("[Jazz Recovery Photo]", JSON.stringify({
+      stage: "capture_failed",
+      commandId: command.id,
+      deviceId: device.id,
+      errorCode: code
+    }));
     await db.transaction(async () => {
       await db.lockDevice(device.id);
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
-        .run(JSON.stringify({ ok: false, error: "Photo capture failed" }), command.id);
+        .run(JSON.stringify({ ok: false, code, error: safeError }), command.id);
       await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAPTURE");
     });
-    return { status: 200, body: { ok: true, photoAvailable: false } };
+    return { status: 200, body: { ok: true, photoAvailable: false, error: safeError, code } };
   }
 
   if (!photoStorageConfigured()) {
@@ -562,8 +595,52 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   }
 
   const key = currentPhotoKey(device.id, command.id, parsed.extension);
-  await uploadPhotoObject({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
+  const uploadStartedAt = Date.now();
+  console.info("[Jazz Recovery Photo]", JSON.stringify({
+    stage: "object_upload_started",
+    commandId: command.id,
+    deviceId: device.id,
+    sizeBytes: parsed.bytes.length
+  }));
+  try {
+    await uploadPhotoObject({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
+    console.info("[Jazz Recovery Photo]", JSON.stringify({
+      stage: "object_upload_completed",
+      commandId: command.id,
+      deviceId: device.id,
+      sizeBytes: parsed.bytes.length,
+      durationMs: Date.now() - uploadStartedAt
+    }));
+  } catch (error) {
+    const storageCode = String(error?.code || error?.Code || error?.name || "UNKNOWN").slice(0, 64);
+    console.error("[Jazz Recovery Photo]", JSON.stringify({
+      stage: "object_upload_failed",
+      commandId: command.id,
+      deviceId: device.id,
+      sizeBytes: parsed.bytes.length,
+      durationMs: Date.now() - uploadStartedAt,
+      errorName: error?.name || "Error",
+      errorCode: storageCode
+    }));
+    const permanentStorageFailure =
+      /not configured|must use HTTPS|NoSuchBucket|AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch|InvalidEndpoint/i
+        .test(`${storageCode} ${String(error?.message || "")}`);
+    if (permanentStorageFailure) {
+      const safeError = "Private photo storage is not configured correctly or the server cannot access it. Check the server's private storage settings.";
+      await db.transaction(async () => {
+        await db.lockDevice(device.id);
+        await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
+          .run(JSON.stringify({ ok: false, code: "PHOTO_STORAGE_CONFIG", error: safeError }), command.id);
+        await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_STORAGE");
+      });
+      return { status: 200, body: { ok: true, photoAvailable: false, code: "PHOTO_STORAGE_CONFIG", error: safeError } };
+    }
+    // Leave transient storage/network failures retryable. The Android companion
+    // has durably queued the exact captured payload and will retry this command ID.
+    throw error;
+  }
   let outcome;
+  const persistenceStartedAt = Date.now();
   try {
     outcome = await db.transaction(async () => {
       await db.lockDevice(device.id);
@@ -587,9 +664,16 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
     throw error;
   }
 
+  console.info("[Jazz Recovery Photo]", JSON.stringify({
+    stage: "postgres_persistence_completed",
+    commandId: command.id,
+    deviceId: device.id,
+    deduplicated: outcome.deduplicated === true,
+    durationMs: Date.now() - persistenceStartedAt
+  }));
   if (outcome.deduplicated) {
     if (outcome.currentKey !== key) await cleanupUploadedPhotoIfUnreferenced(key);
-    return { status: 200, body: { ok: true, deduplicated: true } };
+    return { status: 200, body: { ok: true, deduplicated: true, photoAvailable: outcome.currentKey === key } };
   }
   void processPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup retry failed:", error?.name || "error"));
   return { status: 200, body: { ok: true, photoAvailable: true } };
@@ -1055,6 +1139,7 @@ const server = http.createServer(async (req, res) => {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, photoContentMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
+      const photoReadStartedAt = Date.now();
 
       let state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
       if (!state?.photo_object_key && !state?.photo_data_url) {
@@ -1114,7 +1199,18 @@ const server = http.createServer(async (req, res) => {
           if (!candidate.length || candidate.length > 5 * 1024 * 1024) throw new Error("Current photo size is invalid");
           const declaredMime = state.photo_mime_type || object.ContentType ||
             (state.photo_object_key.endsWith(".png") ? "image/png" : "image/jpeg");
-          const parsed = parsePhotoPayload(candidate.toString("base64"), declaredMime);
+          const detectedMime = detectPhotoMimeType(candidate);
+          if (!detectedMime) throw new Error("Stored object is not a valid bounded JPEG/PNG image.");
+          // The bytes are authoritative. Stale database or object Content-Type metadata
+          // must not make an otherwise valid current photo impossible to display.
+          const parsed = parsePhotoPayload(candidate.toString("base64"), detectedMime);
+          if (declaredMime !== detectedMime) {
+            console.warn("[Jazz Lost Mode] Photo MIME metadata mismatch; serving validated image bytes.", {
+              deviceId: Number(photoContentMatch[1]),
+              storedMime: declaredMime,
+              detectedMime
+            });
+          }
           bytes = parsed.bytes;
           mimeType = parsed.mimeType;
         } else {
@@ -1125,10 +1221,47 @@ const server = http.createServer(async (req, res) => {
           mimeType = parsed.mimeType;
         }
       } catch (error) {
-        console.error("[Jazz Lost Mode] Current photo read/validation failed:", error?.name || "error");
-        return json(req, res, 502, { ok: false, error: "The current photo could not be read or is not a valid JPEG/PNG. Capture a new photo and try again." });
+        const errorName = String(error?.name || "Error").slice(0, 80);
+        const errorCode = String(error?.Code || error?.code || "").slice(0, 80);
+        const storageStatus = Number(error?.$metadata?.httpStatusCode) || null;
+        // Never log credentials, signed URLs, object bytes, or raw provider error messages.
+        console.error("[Jazz Lost Mode] Current photo read/validation failed:", {
+          deviceId: Number(photoContentMatch[1]),
+          errorName,
+          errorCode: errorCode || null,
+          storageStatus,
+          durationMs: Date.now() - photoReadStartedAt
+        });
+        const code = /NoSuchKey|NotFound|NoSuchBucket/i.test(errorCode)
+          ? "PHOTO_OBJECT_NOT_FOUND"
+          : /AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch|Forbidden/i.test(errorCode)
+            ? "PHOTO_STORAGE_ACCESS_DENIED"
+            : /Invalid current photo reference|Stored object is not a valid|Recovery photo must be|Recovery photo encoding/i.test(String(error?.message || ""))
+              ? "PHOTO_INVALID"
+              : /not configured|endpoint must use HTTPS/i.test(String(error?.message || ""))
+                ? "PHOTO_STORAGE_CONFIG"
+                : "PHOTO_STORAGE_UNAVAILABLE";
+        return json(req, res, 502, {
+          ok: false,
+          code,
+          error: code === "PHOTO_OBJECT_NOT_FOUND"
+            ? "The saved photo reference exists, but the image object could not be found in private storage. The current photo record was not deleted."
+            : code === "PHOTO_STORAGE_ACCESS_DENIED"
+              ? "The photo storage service denied access. Check the server's storage bucket permissions and credentials."
+              : code === "PHOTO_INVALID"
+                ? "The stored photo is not a valid JPEG or PNG. The existing photo record was not deleted."
+                : code === "PHOTO_STORAGE_CONFIG"
+                  ? "Private photo storage is not fully configured on this server."
+                  : "The private photo storage service could not return the saved image. Check the server logs for the safe diagnostic code."
+        });
       }
 
+      console.info("[Jazz Recovery Photo]", JSON.stringify({
+        stage: "dashboard_photo_served",
+        deviceId: row.id,
+        sizeBytes: bytes.length,
+        durationMs: Date.now() - photoReadStartedAt
+      }));
       applySecurityHeaders(req, res);
       res.statusCode = 200;
       res.setHeader("Content-Type", mimeType);
@@ -1221,13 +1354,30 @@ const server = http.createServer(async (req, res) => {
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       await expireLocationCommands(row.id);
       const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(locationResultMatch[2], row.id);
-      if (!command || !LOCATION_COMMANDS.has(command.type)) return json(req, res, 404, { ok: false, error: "Command not found" });
+      if (!command || (!LOCATION_COMMANDS.has(command.type) && command.type !== "recovery_photo")) {
+        return json(req, res, 404, { ok: false, error: "Command not found" });
+      }
       const outcome = command.result_json ? JSON.parse(command.result_json) : null;
+      const state = await stateFor(row.id);
+      if (command.type === "recovery_photo") {
+        const status = command.status === "expired" ? "EXPIRED" :
+          command.status === "done" ? (outcome?.ok === true ? "COMPLETED" : "FAILED") :
+          state?.online ? "PENDING" : "DEVICE_OFFLINE";
+        return json(req, res, 200, {
+          ok: true,
+          commandId: command.id,
+          command: command.type,
+          status,
+          photoAvailable: status === "COMPLETED",
+          result: outcome,
+          createdAt: databaseUtcToIso(command.created_at),
+          completedAt: databaseUtcToIso(command.completed_at)
+        });
+      }
       const desired = command.type === "location_enable" ? "ON" : command.type === "location_disable" ? "OFF" : null;
       const confirmed = command.status === "done" && outcome?.ok === true &&
         (desired ? outcome.confirmed === true && outcome.locationServices === desired :
           ["ON","OFF"].includes(outcome.locationServices));
-      const state = await stateFor(row.id);
       const status = confirmed ? "CONFIRMED" :
         command.status === "expired" ? "EXPIRED" :
         command.status === "done" ? "FAILED" :
@@ -1265,7 +1415,11 @@ const server = http.createServer(async (req, res) => {
         await expireLocationCommands(device.id);
         const next = await db.prepare(`SELECT * FROM recovery_commands WHERE device_id=? AND status='pending' AND (leased_until IS NULL OR leased_until<CURRENT_TIMESTAMP) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`).get(device.id);
         if (!next) return null;
-        const leasedUntil = databaseUtcTimestamp(Date.now() + 30_000);
+        // Photo commands include camera startup, Base64 transfer, object upload,
+        // and a PostgreSQL commit. Keep the lease longer than the entire bounded
+        // operation so another sync worker cannot capture the same command again.
+        const leaseDurationMs = next.type === "recovery_photo" ? 120_000 : 30_000;
+        const leasedUntil = databaseUtcTimestamp(Date.now() + leaseDurationMs);
         await db.prepare("UPDATE recovery_commands SET leased_until=? WHERE id=?").run(leasedUntil, next.id);
         return next;
       });
