@@ -30,5 +30,3 @@ services:
         sync: false
       - key: JAZZ_WEBAUTHN_RP_ID
         sync: false
-      - key: JAZZ_PHOTO_DIR
-        sync: false
