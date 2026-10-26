@@ -6,6 +6,7 @@ const jpegFixture = () => Buffer.from([0xff, 0xd8, 0xff, ...Array(18).fill(0), 0
 const pngFixture = () => Buffer.from([137,80,78,71,13,10,26,10,...Array(16).fill(0),0,0,0,0,73,69,78,68,174,66,96,130]);
 
 test("photo payload accepts JPEG and PNG with matching MIME and intact boundaries", () => {
+  assert.deepEqual(parsePhotoPayload(jpegFixture().toString("base64"), "image/jpeg").bytes, jpegFixture());
   assert.equal(parsePhotoPayload(jpegFixture().toString("base64"), "image/jpeg").mimeType, "image/jpeg");
   assert.equal(parsePhotoPayload(pngFixture().toString("base64"), "image/png").mimeType, "image/png");
 });
