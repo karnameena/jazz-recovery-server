@@ -528,14 +528,28 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
   if (command.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
 
+  const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
   if (result.ok !== true || typeof result.imageBase64 !== "string") {
+    const detail = String(result.error || result.status || "Photo capture failed")
+      .replace(/[\\r\\n]+/g, " ").slice(0, 160);
     await db.transaction(async () => {
       await db.lockDevice(device.id);
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
-        .run(JSON.stringify({ ok: false, error: "Photo capture failed" }), command.id);
+        .run(JSON.stringify({ ok: false, error: detail, camera: requestedCamera }), command.id);
       await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAPTURE");
     });
-    return { status: 200, body: { ok: true, photoAvailable: false } };
+    return { status: 200, body: { ok: true, photoAvailable: false, error: detail } };
+  }
+
+  if (result.camera !== requestedCamera) {
+    const detail = "Captured camera does not match the requested camera";
+    await db.transaction(async () => {
+      await db.lockDevice(device.id);
+      await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
+        .run(JSON.stringify({ ok: false, error: detail, camera: result.camera || null }), command.id);
+      await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAMERA_MISMATCH");
+    });
+    return { status: 200, body: { ok: true, photoAvailable: false, error: detail } };
   }
 
   if (!photoStorageConfigured()) {
