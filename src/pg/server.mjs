@@ -455,7 +455,7 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   };
 
   if (result.ok !== true || typeof result.imageBase64 !== "string") {
-    const detail = String(result.error || result.status || "Photo capture failed").replace(/[\\r\\n]+/g, " ").slice(0, 160);
+    const detail = String(result.error || result.status || "Photo capture failed").replaceAll("\r", " ").replaceAll("\n", " ").slice(0, 160);
     return failCapture(detail, "FAILED_CAPTURE");
   }
   if (result.camera !== requestedCamera) {
