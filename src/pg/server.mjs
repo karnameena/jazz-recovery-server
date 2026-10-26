@@ -1139,6 +1139,7 @@ const server = http.createServer(async (req, res) => {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, photoContentMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
+      const photoReadStartedAt = Date.now();
 
       let state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
       if (!state?.photo_object_key && !state?.photo_data_url) {
@@ -1228,7 +1229,8 @@ const server = http.createServer(async (req, res) => {
           deviceId: Number(photoContentMatch[1]),
           errorName,
           errorCode: errorCode || null,
-          storageStatus
+          storageStatus,
+          durationMs: Date.now() - photoReadStartedAt
         });
         const code = /NoSuchKey|NotFound|NoSuchBucket/i.test(errorCode)
           ? "PHOTO_OBJECT_NOT_FOUND"
@@ -1254,6 +1256,12 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
+      console.info("[Jazz Recovery Photo]", JSON.stringify({
+        stage: "dashboard_photo_served",
+        deviceId: row.id,
+        sizeBytes: bytes.length,
+        durationMs: Date.now() - photoReadStartedAt
+      }));
       applySecurityHeaders(req, res);
       res.statusCode = 200;
       res.setHeader("Content-Type", mimeType);
