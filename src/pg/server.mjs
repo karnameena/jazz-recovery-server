@@ -4,7 +4,7 @@ import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
-import { parsePhotoPayload, currentPhotoKey, uploadPhotoObject, getPhotoObject, signedPhotoUrl, deletePhotoObject, photoStorageConfigured, shouldMigrateLegacyPhoto } from "./photos.mjs";
+import { parsePhotoPayload, currentPhotoKey, writePhotoFile, readPhotoFile, localPhotoUrl, deletePhotoFile, localPhotoStorageReady, shouldMigrateLegacyPhoto } from "./photos.mjs";
 import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
 import { TRIAL_DAYS, getTrialConfigForUsername } from "./subscription-config.mjs";
 
@@ -245,36 +245,36 @@ function locationServicesState(value) {
   return value === "ON" || value === "OFF" ? value : "UNKNOWN";
 }
 
-async function migrateLegacyPhotoToObjectStorage(deviceId, legacyState) {
+async function migrateLegacyPhotoToLocalDisk(deviceId, legacyState) {
   if (!shouldMigrateLegacyPhoto(legacyState, legacyState.photo_data_url)) return false;
   const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(legacyState.photo_data_url || ""));
   if (!match) return false;
   const parsed = parsePhotoPayload(match[2], match[1]);
   const key = currentPhotoKey(deviceId, crypto.randomUUID(), parsed.extension);
-  await uploadPhotoObject({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
+  await writePhotoFile({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
   let committed = false;
   try {
     await db.transaction(async () => {
       await db.lockDevice(deviceId);
-      const current = await db.prepare("SELECT photo_data_url,photo_object_key FROM device_state WHERE device_id=?").get(deviceId);
+      const current = await db.prepare("SELECT photo_data_url,photo_local_path FROM device_state WHERE device_id=?").get(deviceId);
       if (!shouldMigrateLegacyPhoto(current, legacyState.photo_data_url)) return;
-      await db.prepare("UPDATE device_state SET photo_object_key=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
+      await db.prepare("UPDATE device_state SET photo_local_path=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
         .run(key, parsed.mimeType, parsed.bytes.length, deviceId);
       committed = true;
     });
   } catch (error) {
-    await cleanupUploadedPhotoIfUnreferenced(key);
+    await cleanupLocalPhotoIfUnreferenced(key);
     throw error;
   }
-  if (!committed) await cleanupUploadedPhotoIfUnreferenced(key);
+  if (!committed) await cleanupLocalPhotoIfUnreferenced(key);
   return committed;
 }
 
 async function publicDevice(row) {
   let state = (await stateFor(row.id)) || {};
-  if (shouldMigrateLegacyPhoto(state, state.photo_data_url) && photoStorageConfigured()) {
+  if (shouldMigrateLegacyPhoto(state, state.photo_data_url) && localPhotoStorageReady()) {
     try {
-      await migrateLegacyPhotoToObjectStorage(row.id, state);
+      await migrateLegacyPhotoToLocalDisk(row.id, state);
       state = (await stateFor(row.id)) || state;
     } catch (error) {
       // Keep the legacy current photo intact and visible if migration cannot
@@ -302,7 +302,7 @@ async function publicDevice(row) {
       accuracyMeters: state.accuracy_meters,
       timestamp: state.location_timestamp
     },
-    photo: state.photo_object_key ? {
+    photo: state.photo_local_path ? {
       camera: state.photo_camera,
       timestamp: state.photo_timestamp,
       mimeType: state.photo_mime_type || "image/jpeg",
@@ -478,47 +478,47 @@ async function updateStateFromResult(device, command, result) {
 }
 
 
-async function processPhotoCleanupJobs() {
-  if (!photoStorageConfigured()) return;
-  const jobs = await db.prepare("SELECT object_key,attempts FROM photo_cleanup_jobs WHERE next_attempt_at<=CURRENT_TIMESTAMP ORDER BY created_at LIMIT 20").all();
+async function processLocalPhotoCleanupJobs() {
+  if (!localPhotoStorageReady()) return;
+  const jobs = await db.prepare("SELECT photo_path,attempts FROM photo_file_cleanup_jobs WHERE next_attempt_at<=CURRENT_TIMESTAMP ORDER BY created_at LIMIT 20").all();
   for (const job of jobs) {
     try {
       // Never delete an object while any device still points at it. This also
       // protects against an ambiguous database COMMIT result during recovery.
-      const activeReference = await db.prepare("SELECT 1 FROM device_state WHERE photo_object_key=? LIMIT 1").get(job.object_key);
+      const activeReference = await db.prepare("SELECT 1 FROM device_state WHERE photo_local_path=? LIMIT 1").get(job.photo_path);
       if (activeReference) {
-        await db.prepare("DELETE FROM photo_cleanup_jobs WHERE object_key=?").run(job.object_key);
+        await db.prepare("DELETE FROM photo_file_cleanup_jobs WHERE photo_path=?").run(job.photo_path);
         continue;
       }
-      await deletePhotoObject(job.object_key);
-      await db.prepare("DELETE FROM photo_cleanup_jobs WHERE object_key=?").run(job.object_key);
+      await deletePhotoFile(job.photo_path);
+      await db.prepare("DELETE FROM photo_file_cleanup_jobs WHERE photo_path=?").run(job.photo_path);
     } catch (error) {
       const attempts = Number(job.attempts || 0) + 1;
       const delaySeconds = Math.min(3600, 15 * (2 ** Math.min(attempts, 8)));
       const errorCode = String(error?.name || error?.Code || "StorageDeleteFailed").slice(0, 80);
-      await db.prepare("UPDATE photo_cleanup_jobs SET attempts=?,next_attempt_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 second'),last_error=? WHERE object_key=?")
-        .run(attempts, delaySeconds, errorCode, job.object_key).catch(() => {});
+      await db.prepare("UPDATE photo_file_cleanup_jobs SET attempts=?,next_attempt_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 second'),last_error=? WHERE photo_path=?")
+        .run(attempts, delaySeconds, errorCode, job.photo_path).catch(() => {});
     }
   }
 }
 
-async function cleanupUploadedPhotoIfUnreferenced(key) {
+async function cleanupLocalPhotoIfUnreferenced(key) {
   if (!key) return;
   let referenced;
   try {
-    referenced = await db.prepare("SELECT 1 FROM device_state WHERE photo_object_key=? LIMIT 1").get(key);
+    referenced = await db.prepare("SELECT 1 FROM device_state WHERE photo_local_path=? LIMIT 1").get(key);
   } catch {
     // A failed query cannot prove the object is unused. Queue it for a retry;
     // the worker rechecks references before every deletion.
-    await db.prepare("INSERT INTO photo_cleanup_jobs(object_key) VALUES(?) ON CONFLICT(object_key) DO NOTHING")
+    await db.prepare("INSERT INTO photo_file_cleanup_jobs(photo_path) VALUES(?) ON CONFLICT(photo_path) DO NOTHING")
       .run(key).catch(() => {});
     return;
   }
   if (referenced) return;
   try {
-    await deletePhotoObject(key);
+    await deletePhotoFile(key);
   } catch {
-    await db.prepare("INSERT INTO photo_cleanup_jobs(object_key) VALUES(?) ON CONFLICT(object_key) DO NOTHING")
+    await db.prepare("INSERT INTO photo_file_cleanup_jobs(photo_path) VALUES(?) ON CONFLICT(photo_path) DO NOTHING")
       .run(key).catch(() => {});
   }
 }
@@ -552,14 +552,14 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
     return { status: 200, body: { ok: true, photoAvailable: false, error: detail } };
   }
 
-  if (!photoStorageConfigured()) {
+  if (!localPhotoStorageReady()) {
     await db.transaction(async () => {
       await db.lockDevice(device.id);
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
-        .run(JSON.stringify({ ok: false, error: "Private photo storage is not configured" }), command.id);
+        .run(JSON.stringify({ ok: false, error: "Local photo storage is unavailable" }), command.id);
       await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_STORAGE_CONFIG");
     });
-    return { status: 200, body: { ok: true, photoAvailable: false, error: "Private photo storage is not configured" } };
+    return { status: 200, body: { ok: true, photoAvailable: false, error: "Local photo storage is unavailable" } };
   }
 
   let parsed;
@@ -576,36 +576,36 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   }
 
   const key = currentPhotoKey(device.id, command.id, parsed.extension);
-  await uploadPhotoObject({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
+  await writePhotoFile({ key, bytes: parsed.bytes, mimeType: parsed.mimeType });
   let outcome;
   try {
     outcome = await db.transaction(async () => {
       await db.lockDevice(device.id);
       const currentCommand = await db.prepare("SELECT status FROM recovery_commands WHERE id=? AND device_id=?").get(command.id, device.id);
-      const current = await db.prepare("SELECT photo_object_key FROM device_state WHERE device_id=?").get(device.id);
+      const current = await db.prepare("SELECT photo_local_path FROM device_state WHERE device_id=?").get(device.id);
       if (!currentCommand || currentCommand.status === "done") {
-        return { deduplicated: true, currentKey: current?.photo_object_key || null };
+        return { deduplicated: true, currentKey: current?.photo_local_path || null };
       }
-      await db.prepare("UPDATE device_state SET photo_object_key=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,photo_camera=?,photo_timestamp=?,last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
+      await db.prepare("UPDATE device_state SET photo_local_path=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,photo_camera=?,photo_timestamp=?,last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
         .run(key, parsed.mimeType, parsed.bytes.length, result.camera === "rear" ? "rear" : "front", Number(result.timestamp) || Date.now(), device.id);
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
         .run(JSON.stringify({ ok: true, camera: result.camera === "rear" ? "rear" : "front", mimeType: parsed.mimeType, sizeBytes: parsed.bytes.length, timestamp: Number(result.timestamp) || Date.now() }), command.id);
-      if (current?.photo_object_key && current.photo_object_key !== key) {
-        await db.prepare("INSERT INTO photo_cleanup_jobs(object_key) VALUES(?) ON CONFLICT(object_key) DO NOTHING").run(current.photo_object_key);
+      if (current?.photo_local_path && current.photo_local_path !== key) {
+        await db.prepare("INSERT INTO photo_file_cleanup_jobs(photo_path) VALUES(?) ON CONFLICT(photo_path) DO NOTHING").run(current.photo_local_path);
       }
       await audit(device.user_id, device.id, "RECOVERY_PHOTO", "SUCCESS");
-      return { deduplicated: false, oldKey: current?.photo_object_key || null, currentKey: key };
+      return { deduplicated: false, oldKey: current?.photo_local_path || null, currentKey: key };
     });
   } catch (error) {
-    await cleanupUploadedPhotoIfUnreferenced(key);
+    await cleanupLocalPhotoIfUnreferenced(key);
     throw error;
   }
 
   if (outcome.deduplicated) {
-    if (outcome.currentKey !== key) await cleanupUploadedPhotoIfUnreferenced(key);
+    if (outcome.currentKey !== key) await cleanupLocalPhotoIfUnreferenced(key);
     return { status: 200, body: { ok: true, deduplicated: true } };
   }
-  void processPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup retry failed:", error?.name || "error"));
+  void processLocalPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup retry failed:", error?.name || "error"));
   return { status: 200, body: { ok: true, photoAvailable: true } };
 }
 
@@ -1070,15 +1070,15 @@ const server = http.createServer(async (req, res) => {
       const row = await ownerDevice(session.user_id, photoContentMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
 
-      let state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
-      if (!state?.photo_object_key && !state?.photo_data_url) {
+      let state = await db.prepare("SELECT photo_local_path,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
+      if (!state?.photo_local_path && !state?.photo_data_url) {
         return json(req, res, 404, { ok: false, error: "No current recovery photo" });
       }
 
       // One-time, lazy migration for a legacy current photo stored as a data URL
       // in PostgreSQL. Upload first; clear the database bytes only after the new
-      // private object is safely committed as the current reference.
-      if (shouldMigrateLegacyPhoto(state, state.photo_data_url) && photoStorageConfigured()) {
+      // local file is safely committed as the current reference.
+      if (shouldMigrateLegacyPhoto(state, state.photo_data_url) && localPhotoStorageReady()) {
         const legacyDataUrl = state.photo_data_url;
         try {
           const legacyMatch = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(legacyDataUrl);
@@ -1086,48 +1086,48 @@ const server = http.createServer(async (req, res) => {
           const legacyPhoto = parsePhotoPayload(legacyMatch[2], legacyMatch[1]);
           const migrationCommandId = crypto.randomUUID();
           const migrationKey = currentPhotoKey(row.id, migrationCommandId, legacyPhoto.extension);
-          await uploadPhotoObject({ key: migrationKey, bytes: legacyPhoto.bytes, mimeType: legacyPhoto.mimeType });
+          await writePhotoFile({ key: migrationKey, bytes: legacyPhoto.bytes, mimeType: legacyPhoto.mimeType });
           let committed = false;
           try {
             committed = await db.transaction(async () => {
               await db.lockDevice(row.id);
-              const latest = await db.prepare("SELECT photo_object_key,photo_data_url FROM device_state WHERE device_id=?").get(row.id);
-              if (!latest || latest.photo_object_key || latest.photo_data_url !== legacyDataUrl) return false;
-              await db.prepare("UPDATE device_state SET photo_object_key=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
+              const latest = await db.prepare("SELECT photo_local_path,photo_data_url FROM device_state WHERE device_id=?").get(row.id);
+              if (!latest || latest.photo_local_path || latest.photo_data_url !== legacyDataUrl) return false;
+              await db.prepare("UPDATE device_state SET photo_local_path=?,photo_data_url=NULL,photo_mime_type=?,photo_size_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?")
                 .run(migrationKey, legacyPhoto.mimeType, legacyPhoto.bytes.length, row.id);
               return true;
             });
           } catch (error) {
-            await cleanupUploadedPhotoIfUnreferenced(migrationKey);
+            await cleanupLocalPhotoIfUnreferenced(migrationKey);
             throw error;
           }
           if (!committed) {
-            await cleanupUploadedPhotoIfUnreferenced(migrationKey);
+            await cleanupLocalPhotoIfUnreferenced(migrationKey);
           }
-          state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
+          state = await db.prepare("SELECT photo_local_path,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
         } catch (error) {
           // Migration is opportunistic: retain and serve the legacy current
           // photo if storage is temporarily unavailable. Never erase it first.
           console.error("[Jazz Lost Mode] Legacy photo migration deferred:", error?.name || "error");
-          state = await db.prepare("SELECT photo_object_key,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
+          state = await db.prepare("SELECT photo_local_path,photo_data_url,photo_mime_type,photo_size_bytes,photo_camera,photo_timestamp FROM device_state WHERE device_id=?").get(row.id);
         }
       }
 
-      if (!state?.photo_object_key && !state?.photo_data_url) {
+      if (!state?.photo_local_path && !state?.photo_data_url) {
         return json(req, res, 404, { ok: false, error: "No current recovery photo" });
       }
 
       let bytes;
       let mimeType;
       try {
-        if (state.photo_object_key) {
-          const object = await getPhotoObject(state.photo_object_key);
-          if (!object?.Body) throw new Error("Current photo object is empty");
+        if (state.photo_local_path) {
+          const object = await readPhotoFile(state.photo_local_path);
+          if (!object?.Body) throw new Error("Current photo file is empty");
           const rawBytes = await object.Body.transformToByteArray();
           const candidate = Buffer.from(rawBytes);
           if (!candidate.length || candidate.length > 5 * 1024 * 1024) throw new Error("Current photo size is invalid");
           const declaredMime = state.photo_mime_type || object.ContentType ||
-            (state.photo_object_key.endsWith(".png") ? "image/png" : "image/jpeg");
+            (state.photo_local_path.endsWith(".png") ? "image/png" : "image/jpeg");
           const parsed = parsePhotoPayload(candidate.toString("base64"), declaredMime);
           bytes = parsed.bytes;
           mimeType = parsed.mimeType;
@@ -1158,10 +1158,12 @@ const server = http.createServer(async (req, res) => {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, photoUrlMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
-      const state = await db.prepare("SELECT photo_object_key,photo_data_url FROM device_state WHERE device_id=?").get(row.id);
+      const state = await db.prepare("SELECT photo_local_path,photo_data_url FROM device_state WHERE device_id=?").get(row.id);
       if (state?.photo_data_url) return json(req, res, 200, { ok: true, url: state.photo_data_url, legacy: true });
-      if (!state?.photo_object_key) return json(req, res, 404, { ok: false, error: "No current recovery photo" });
-      return json(req, res, 200, { ok: true, url: await signedPhotoUrl(state.photo_object_key, { download: url.searchParams.get("download") === "1" }) });
+      if (!state?.photo_local_path) return json(req, res, 404, { ok: false, error: "No current recovery photo" });
+      const scheme = String(req.headers["x-forwarded-proto"] || (req.socket?.encrypted ? "https" : "http")).split(",")[0].trim();
+      const base = scheme + "://" + String(req.headers.host || "localhost");
+      return json(req, res, 200, { ok: true, url: base + "/api/devices/" + row.id + "/photo-content" + (url.searchParams.get("download") === "1" ? "?download=1" : "") });
     }
 
     const photoDeleteMatch = path.match(/^\/api\/devices\/(\d+)\/photo$/);
@@ -1171,14 +1173,14 @@ const server = http.createServer(async (req, res) => {
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       await db.transaction(async () => {
         await db.lockDevice(row.id);
-        const state = await db.prepare("SELECT photo_object_key FROM device_state WHERE device_id=?").get(row.id);
-        await db.prepare("UPDATE device_state SET photo_object_key=NULL,photo_data_url=NULL,photo_mime_type=NULL,photo_size_bytes=NULL,photo_camera=NULL,photo_timestamp=NULL,updated_at=CURRENT_TIMESTAMP WHERE device_id=?").run(row.id);
-        if (state?.photo_object_key) {
-          await db.prepare("INSERT INTO photo_cleanup_jobs(object_key) VALUES(?) ON CONFLICT(object_key) DO NOTHING").run(state.photo_object_key);
+        const state = await db.prepare("SELECT photo_local_path FROM device_state WHERE device_id=?").get(row.id);
+        await db.prepare("UPDATE device_state SET photo_local_path=NULL,photo_data_url=NULL,photo_mime_type=NULL,photo_size_bytes=NULL,photo_camera=NULL,photo_timestamp=NULL,updated_at=CURRENT_TIMESTAMP WHERE device_id=?").run(row.id);
+        if (state?.photo_local_path) {
+          await db.prepare("INSERT INTO photo_file_cleanup_jobs(photo_path) VALUES(?) ON CONFLICT(photo_path) DO NOTHING").run(state.photo_local_path);
         }
         await audit(session.user_id, row.id, "DELETE_CURRENT_RECOVERY_PHOTO", "SUCCESS");
       });
-      void processPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup retry failed:", error?.name || "error"));
+      void processLocalPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup retry failed:", error?.name || "error"));
       return json(req, res, 200, { ok: true, photoAvailable: false });
     }
 
@@ -1353,7 +1355,7 @@ server.listen(port, "0.0.0.0", () => {
 });
 
 const photoCleanupTimer = setInterval(() => {
-  void processPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup worker failed:", error?.name || "error"));
+  void processLocalPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup worker failed:", error?.name || "error"));
 }, 30_000);
 photoCleanupTimer.unref();
-void processPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Initial photo cleanup failed:", error?.name || "error"));
+void processLocalPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Initial photo cleanup failed:", error?.name || "error"));
