@@ -1329,7 +1329,11 @@ const server = http.createServer(async (req, res) => {
         await expireLocationCommands(device.id);
         const next = await db.prepare(`SELECT * FROM recovery_commands WHERE device_id=? AND status='pending' AND (leased_until IS NULL OR leased_until<CURRENT_TIMESTAMP) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`).get(device.id);
         if (!next) return null;
-        const leasedUntil = databaseUtcTimestamp(Date.now() + 30_000);
+        // Photo commands include camera startup, Base64 transfer, object upload,
+        // and a PostgreSQL commit. Keep the lease longer than the entire bounded
+        // operation so another sync worker cannot capture the same command again.
+        const leaseDurationMs = next.type === "recovery_photo" ? 120_000 : 30_000;
+        const leasedUntil = databaseUtcTimestamp(Date.now() + leaseDurationMs);
         await db.prepare("UPDATE recovery_commands SET leased_until=? WHERE id=?").run(leasedUntil, next.id);
         return next;
       });
