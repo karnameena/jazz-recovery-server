@@ -198,6 +198,37 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     assert.equal(storedPhoto.rows[0].photo_data_url,"data:image/jpeg;base64,"+verifiedJpeg.toString("base64"));
     assert.equal(storedPhoto.rows[0].photo_mime_type,"image/jpeg");
     assert.equal(Number(storedPhoto.rows[0].photo_size_bytes),verifiedJpeg.length);
+
+    // Simulate a PostgreSQL write failure after a verified photo already exists.
+    // The API must return failure and the transaction must roll back to the old bytes.
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION jazz_test_reject_photo_update() RETURNS trigger AS $
+      BEGIN
+        RAISE EXCEPTION 'forced photo write failure for isolated integration test';
+      END;
+      $ LANGUAGE plpgsql;
+      CREATE TRIGGER jazz_test_reject_photo_update
+      BEFORE UPDATE ON device_state
+      FOR EACH ROW
+      WHEN (OLD.photo_data_url IS DISTINCT FROM NEW.photo_data_url)
+      EXECUTE FUNCTION jazz_test_reject_photo_update();
+    `);
+    try {
+      const databaseFailureReplacement = await api("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},sessionHeaders);
+      assert.equal(databaseFailureReplacement.status,202);
+      const databaseFailureResult = await api("POST","/android/device/commands/"+databaseFailureReplacement.data.commandId+"/result",{
+        deviceId:"existing-phone",
+        result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:Buffer.from([0xff,0xd8,0xff,...Array(18).fill(1),0xff,0xd9]).toString("base64"),timestamp:Date.now()}
+      },deviceHeaders);
+      assert.equal(databaseFailureResult.status,503,"Database write failure must be reported as a failed upload");
+      assert.equal(databaseFailureResult.data.photoAvailable,false);
+      const afterDatabaseFailure = await fetch(base+"/api/devices/"+id+"/photo-content",{headers:sessionHeaders,cache:"no-store"});
+      assert.equal(afterDatabaseFailure.status,200,"Previously verified photo must remain readable after a database write failure");
+      assert.deepEqual(Buffer.from(await afterDatabaseFailure.arrayBuffer()),verifiedJpeg,"Transaction rollback must preserve the previous verified photo bytes");
+    } finally {
+      await pool.query("DROP TRIGGER IF EXISTS jazz_test_reject_photo_update ON device_state");
+      await pool.query("DROP FUNCTION IF EXISTS jazz_test_reject_photo_update()");
+    }
     const voiceAudio = Buffer.alloc(46);
     voiceAudio.write("RIFF",0,"ascii");voiceAudio.write("WAVE",8,"ascii");
     voiceAudio.writeUInt16LE(1,20);voiceAudio.writeUInt16LE(1,22);
