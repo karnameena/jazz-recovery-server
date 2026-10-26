@@ -693,7 +693,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && resultMatch) {
       const device = await authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
-      const body = await readJson(req, 8 * 1024 * 1024);
+      // Photo results contain base64 expansion plus JSON overhead. The body limit
+      // must be larger than the validated image payload limit or valid photos can
+      // be rejected before the result handler has a chance to store them.
+      const body = await readJson(req, 12 * 1024 * 1024);
       const result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
       const response = await db.transaction(async () => {
         await db.lockDevice(device.id);
