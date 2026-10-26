@@ -931,13 +931,22 @@ const server = http.createServer(async (req, res) => {
         command.status === "done" ? "FAILED" :
         state?.online ? "PENDING" : "DEVICE_OFFLINE";
 
+      const publicOutcome = command.type === "recovery_photo" && outcome
+        ? {
+            ok: outcome.ok === true,
+            camera: outcome.camera ?? null,
+            timestamp: outcome.timestamp ?? null,
+            status: outcome.status ?? null,
+            error: outcome.error ?? null
+          }
+        : outcome;
       return json(req, res, 200, {
         ok: true,
         commandId: command.id,
         status,
         confirmed,
         command: command.type,
-        result: outcome,
+        result: publicOutcome,
         createdAt: databaseUtcToIso(command.created_at),
         completedAt: databaseUtcToIso(command.completed_at)
       });
