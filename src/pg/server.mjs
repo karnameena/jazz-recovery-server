@@ -598,30 +598,53 @@ const server = http.createServer(async (req, res) => {
       return json(req, res, response.status, response.body, response.headers || {});
     }
 
-    // Result is read only by the authenticated owner of the enrolled device.
-    // Browser never treats HTTP 202 queue acceptance as a successful toggle.
-    const locationResultMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
-    if (req.method === "GET" && locationResultMatch) {
+    // Read command status for any owner-authorized recovery action.
+    // Location toggles require state confirmation; photo and other actions require
+    // an acknowledged successful device result. Never return another owner's command.
+    const commandResultMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
+    if (req.method === "GET" && commandResultMatch) {
       const session = await requireSession(req, res); if (!session) return;
-      const row = await ownerDevice(session.user_id, locationResultMatch[1]);
+      const row = await ownerDevice(session.user_id, commandResultMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       await expireLocationCommands(row.id);
-      const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(locationResultMatch[2], row.id);
-      if (!command || !LOCATION_COMMANDS.has(command.type)) return json(req, res, 404, { ok: false, error: "Command not found" });
+      const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?")
+        .get(commandResultMatch[2], row.id);
+      if (!command) return json(req, res, 404, { ok: false, error: "Command not found" });
+
       const outcome = command.result_json ? JSON.parse(command.result_json) : null;
-      const desired = command.type === "location_enable" ? "ON" : command.type === "location_disable" ? "OFF" : null;
+      const isLocationCommand = LOCATION_COMMANDS.has(command.type);
+      const desired = command.type === "location_enable" ? "ON" :
+        command.type === "location_disable" ? "OFF" : null;
       const confirmed = command.status === "done" && outcome?.ok === true &&
-        (desired ? outcome.confirmed === true && outcome.locationServices === desired :
-          ["ON","OFF"].includes(outcome.locationServices));
+        (desired
+          ? outcome.confirmed === true && outcome.locationServices === desired
+          : isLocationCommand
+            ? ["ON", "OFF"].includes(outcome?.locationServices)
+            : true);
       const state = await stateFor(row.id);
       const status = confirmed ? "CONFIRMED" :
         command.status === "expired" ? "EXPIRED" :
         command.status === "done" ? "FAILED" :
         state?.online ? "PENDING" : "DEVICE_OFFLINE";
-      return json(req, res, 200, { ok: true, commandId: command.id, status,
-        confirmed, command: command.type, result: outcome,
+      const publicOutcome = command.type === "recovery_photo" && outcome
+        ? {
+            ok: outcome.ok === true,
+            camera: outcome.camera ?? null,
+            timestamp: outcome.timestamp ?? null,
+            status: outcome.status ?? null,
+            error: outcome.error ?? null
+          }
+        : outcome;
+      return json(req, res, 200, {
+        ok: true,
+        commandId: command.id,
+        status,
+        confirmed,
+        command: command.type,
+        result: publicOutcome,
         createdAt: sqliteUtcToIso(command.created_at),
-        completedAt: sqliteUtcToIso(command.completed_at) });
+        completedAt: sqliteUtcToIso(command.completed_at)
+      });
     }
 
     const auditMatch = path.match(/^\/api\/devices\/(\d+)\/audit$/);
@@ -670,12 +693,27 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && resultMatch) {
       const device = await authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
-      const body = await readJson(req, 8 * 1024 * 1024);
+      // Photo results contain base64 expansion plus JSON overhead. The body limit
+      // must be larger than the validated image payload limit or valid photos can
+      // be rejected before the result handler has a chance to store them.
+      const body = await readJson(req, 12 * 1024 * 1024);
       const result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
       const response = await db.transaction(async () => {
         await db.lockDevice(device.id);
       const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
       if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
+      if (command.type === "recovery_photo" && result.ok === true) {
+        const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
+        if (typeof result.imageBase64 !== "string" ||
+            result.imageBase64.length === 0 ||
+            result.imageBase64.length > 10 * 1024 * 1024 ||
+            result.imageBase64.length % 4 !== 0 ||
+            !/^[A-Za-z0-9+/]+={0,2}$/.test(result.imageBase64) ||
+            !["front", "rear"].includes(result.camera) ||
+            result.camera !== requestedCamera) {
+          return { status: 422, body: { ok: false, error: "Invalid recovery photo payload or camera mismatch" } };
+        }
+      }
       if (LOCATION_COMMANDS.has(command.type)) {
         await expireLocationCommands(device.id);
         const refreshed = await db.prepare("SELECT status FROM recovery_commands WHERE id=?").get(command.id);
