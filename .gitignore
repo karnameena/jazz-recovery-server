@@ -23,3 +23,6 @@ Thumbs.db
 # Local Neon CLI project/org/branch binding (may expose internal metadata)
 .neon
 .neon/
+
+# Current recovery photos are private local runtime files; never commit them.
+var/photos/
