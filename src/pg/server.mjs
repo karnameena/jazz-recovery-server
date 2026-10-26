@@ -974,7 +974,7 @@ const server = http.createServerconst server = http.createServer(async (req, res
       res.statusCode = 200;
       res.setHeader("Content-Type", parsed.mimeType);
       res.setHeader("Content-Length", String(parsed.bytes.length));
-      res.setHeader("Content-Disposition", (url.searchParams.get("download") === "1" ? "attachment" : "inline") + "; filename=\\\"jazz-recovery-current." + (parsed.mimeType === "image/png" ? "png" : "jpg") + "\\\"");
+      res.setHeader("Content-Disposition", (url.searchParams.get("download") === "1" ? "attachment" : "inline") + "; filename=jazz-recovery-current." + (parsed.mimeType === "image/png" ? "png" : "jpg"));
       res.setHeader("Cache-Control", "private, no-store, max-age=0");
       res.end(parsed.bytes);
       return;
