@@ -528,14 +528,28 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
   if (command.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
 
+  const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
   if (result.ok !== true || typeof result.imageBase64 !== "string") {
+    const detail = String(result.error || result.status || "Photo capture failed")
+      .replace(/[\\r\\n]+/g, " ").slice(0, 160);
     await db.transaction(async () => {
       await db.lockDevice(device.id);
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
-        .run(JSON.stringify({ ok: false, error: "Photo capture failed" }), command.id);
+        .run(JSON.stringify({ ok: false, error: detail, camera: requestedCamera }), command.id);
       await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAPTURE");
     });
-    return { status: 200, body: { ok: true, photoAvailable: false } };
+    return { status: 200, body: { ok: true, photoAvailable: false, error: detail } };
+  }
+
+  if (result.camera !== requestedCamera) {
+    const detail = "Captured camera does not match the requested camera";
+    await db.transaction(async () => {
+      await db.lockDevice(device.id);
+      await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
+        .run(JSON.stringify({ ok: false, error: detail, camera: result.camera || null }), command.id);
+      await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAMERA_MISMATCH");
+    });
+    return { status: 200, body: { ok: true, photoAvailable: false, error: detail } };
   }
 
   if (!photoStorageConfigured()) {
@@ -1212,30 +1226,41 @@ const server = http.createServer(async (req, res) => {
       return json(req, res, response.status, response.body, response.headers || {});
     }
 
-    // Result is read only by the authenticated owner of the enrolled device.
-    // Browser never treats HTTP 202 queue acceptance as a successful toggle.
-    const locationResultMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
-    if (req.method === "GET" && locationResultMatch) {
+    // Command status is readable only by the authenticated owner of the enrolled device.
+    // Support every command type; the former location-only guard returned 404 for photo commands.
+    const commandStatusMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
+    if (req.method === "GET" && commandStatusMatch) {
       const session = await requireSession(req, res); if (!session) return;
-      const row = await ownerDevice(session.user_id, locationResultMatch[1]);
+      const row = await ownerDevice(session.user_id, commandStatusMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
-      await expireLocationCommands(row.id);
-      const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(locationResultMatch[2], row.id);
-      if (!command || !LOCATION_COMMANDS.has(command.type)) return json(req, res, 404, { ok: false, error: "Command not found" });
-      const outcome = command.result_json ? JSON.parse(command.result_json) : null;
-      const desired = command.type === "location_enable" ? "ON" : command.type === "location_disable" ? "OFF" : null;
-      const confirmed = command.status === "done" && outcome?.ok === true &&
+      const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?")
+        .get(commandStatusMatch[2], row.id);
+      if (!command) return json(req, res, 404, { ok: false, error: "Command not found" });
+      if (LOCATION_COMMANDS.has(command.type)) await expireLocationCommands(row.id);
+      const refreshed = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?")
+        .get(command.id, row.id);
+      if (!refreshed) return json(req, res, 404, { ok: false, error: "Command not found" });
+      const outcome = refreshed.result_json ? JSON.parse(refreshed.result_json) : null;
+      const desired = refreshed.type === "location_enable" ? "ON" :
+        refreshed.type === "location_disable" ? "OFF" : null;
+      const confirmed = LOCATION_COMMANDS.has(refreshed.type) &&
+        refreshed.status === "done" && outcome?.ok === true &&
         (desired ? outcome.confirmed === true && outcome.locationServices === desired :
-          ["ON","OFF"].includes(outcome.locationServices));
+          ["ON", "OFF"].includes(outcome.locationServices));
       const state = await stateFor(row.id);
-      const status = confirmed ? "CONFIRMED" :
-        command.status === "expired" ? "EXPIRED" :
-        command.status === "done" ? "FAILED" :
-        state?.online ? "PENDING" : "DEVICE_OFFLINE";
-      return json(req, res, 200, { ok: true, commandId: command.id, status,
-        confirmed, command: command.type, result: outcome,
-        createdAt: databaseUtcToIso(command.created_at),
-        completedAt: databaseUtcToIso(command.completed_at) });
+      const status = LOCATION_COMMANDS.has(refreshed.type)
+        ? (confirmed ? "CONFIRMED" :
+            refreshed.status === "expired" ? "EXPIRED" :
+            refreshed.status === "done" ? "FAILED" :
+            state?.online ? "PENDING" : "DEVICE_OFFLINE")
+        : (refreshed.status === "expired" ? "EXPIRED" :
+            refreshed.status === "done" ? (outcome?.ok === false ? "FAILED" : "COMPLETE") :
+            state?.online ? "PENDING" : "DEVICE_OFFLINE");
+      // Never return photo bytes through status polling. Photo results contain metadata only.
+      return json(req, res, 200, { ok: true, commandId: refreshed.id, status,
+        confirmed, command: refreshed.type, result: outcome,
+        createdAt: databaseUtcToIso(refreshed.created_at),
+        completedAt: databaseUtcToIso(refreshed.completed_at) });
     }
 
     const auditMatch = path.match(/^\/api\/devices\/(\d+)\/audit$/);
