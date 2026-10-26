@@ -991,21 +991,22 @@ const server = http.createServer(async (req, res) => {
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
       const body = await readJson(req, 8 * 1024 * 1024);
       const result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
-      // Reject malformed successful photo results instead of marking them done
-      // while silently leaving the dashboard's current photo unchanged.
-      if (result.ok === true && result.imageBase64 != null) {
-        if (typeof result.imageBase64 !== "string" ||
-            result.imageBase64.length === 0 ||
-            result.imageBase64.length > 10 * 1024 * 1024 ||
-            result.imageBase64.length % 4 !== 0 ||
-            !/^[A-Za-z0-9+/]+={0,2}$/.test(result.imageBase64)) {
-          return json(req, res, 422, { ok: false, error: "Invalid recovery photo payload" });
-        }
-      }
       const response = await db.transaction(async () => {
         await db.lockDevice(device.id);
       const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
       if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
+      if (command.type === "recovery_photo" && result.ok === true) {
+        const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
+        if (typeof result.imageBase64 !== "string" ||
+            result.imageBase64.length === 0 ||
+            result.imageBase64.length > 10 * 1024 * 1024 ||
+            result.imageBase64.length % 4 !== 0 ||
+            !/^[A-Za-z0-9+/]+={0,2}$/.test(result.imageBase64) ||
+            !["front", "rear"].includes(result.camera) ||
+            result.camera !== requestedCamera) {
+          return { status: 422, body: { ok: false, error: "Invalid recovery photo payload or camera mismatch" } };
+        }
+      }
       if (LOCATION_COMMANDS.has(command.type)) {
         await expireLocationCommands(device.id);
         const refreshed = await db.prepare("SELECT status FROM recovery_commands WHERE id=?").get(command.id);
