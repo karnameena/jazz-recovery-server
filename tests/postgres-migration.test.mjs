@@ -376,12 +376,14 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     const repair = await api("POST", "/api/auth/device-repair", {
       username: "recovery-owner",
       password: "ResetRecovery123!",
-      deviceId: "jazz-recovery-test",
+      // Exercise a Device ID copied with different letter case from an older screen.
+      deviceId: "JAZZ-RECOVERY-TEST",
       deviceToken: repairedToken,
       deviceName: "Recovered Test Phone",
       imei: "123456789012345"
     });
     assert.equal(repair.status, 200, "Authenticated repair must update the existing paired device without deleting its state");
+    assert.equal(repair.data.deviceId, "jazz-recovery-test", "Repair must return the canonical registered Device ID");
     const oldDeviceToken = await api("POST", "/android/device/heartbeat", {
       deviceId: "jazz-recovery-test", status: { battery: 78 }
     }, { Authorization: "Bearer " + recoveryToken, "X-Jazz-Lost-Device-Id": "jazz-recovery-test" });
