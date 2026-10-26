@@ -1228,7 +1228,7 @@ const server = http.createServer(async (req, res) => {
 
     // Command status is readable only by the authenticated owner of the enrolled device.
     // Support every command type; the former location-only guard returned 404 for photo commands.
-    const commandStatusMatch = path.match(/^\\/api\\/devices\\/(\\d+)\\/commands\\/([a-f0-9-]{36})$/i);
+    const commandStatusMatch = path.match(/^\/api\/devices\/(\d+)\/commands\/([a-f0-9-]{36})$/i);
     if (req.method === "GET" && commandStatusMatch) {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, commandStatusMatch[1]);
