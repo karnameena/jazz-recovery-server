@@ -4,7 +4,7 @@ import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
-import { parsePhotoPayload, currentPhotoKey, writePhotoFile, readPhotoFile, localPhotoUrl, deletePhotoFile, localPhotoStorageReady, shouldMigrateLegacyPhoto } from "./photos.mjs";
+import { parsePhotoPayload, currentPhotoKey, writePhotoFile, readPhotoFile, deletePhotoFile, localPhotoStorageReady, shouldMigrateLegacyPhoto } from "./photos.mjs";
 import { handleBillingRoute, ensureDefaultDiscountCodes } from "./billing.mjs";
 import { TRIAL_DAYS, getTrialConfigForUsername } from "./subscription-config.mjs";
 
