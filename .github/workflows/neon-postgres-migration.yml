@@ -1,7 +1,7 @@
 name: Jazz PostgreSQL Migration Verification
 on:
   push:
-    branches: [feature/neon-only-runtime-cleanup-20261024]
+    branches: [feature/neon-only-runtime-cleanup-20261024, fix/recovery-command-status-photo-20261026]
   pull_request:
   workflow_dispatch:
 
