@@ -1,9 +1,38 @@
 import crypto from "node:crypto";
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
-let client;
+const MIME_BY_EXTENSION = { jpg: "image/jpeg", png: "image/png" };
+
+function photoRoot() {
+  const configured = String(process.env.JAZZ_PHOTO_DIR || "").trim();
+  if (process.env.NODE_ENV === "production" && !configured) {
+    throw new Error("JAZZ_PHOTO_DIR must point to a persistent local directory in production.");
+  }
+  return path.resolve(configured || path.join(process.cwd(), "var", "photos"));
+}
+
+function safeRelativeKey(key) {
+  if (typeof key !== "string" || key.includes("\\") || key.startsWith("/") ||
+      key.split("/").some(part => !part || part === "." || part === "..")) {
+    throw new Error("Invalid current recovery photo path.");
+  }
+  const parts = key.split("/");
+  if (parts.length !== 4 || parts[0] !== "devices" ||
+      !/^\d+$/.test(parts[1]) || !/^[a-f0-9-]{36}$/i.test(parts[2]) ||
+      !/^[a-f0-9-]{36}\.(?:jpg|png)$/i.test(parts[3])) {
+    throw new Error("Invalid current recovery photo path.");
+  }
+  return key;
+}
+
+function absolutePhotoPath(key) {
+  const root = photoRoot();
+  const target = path.resolve(root, safeRelativeKey(key));
+  if (!target.startsWith(root + path.sep)) throw new Error("Invalid current recovery photo path.");
+  return target;
+}
 
 export function parsePhotoPayload(imageBase64, declaredMimeType) {
   if (typeof imageBase64 !== "string" || imageBase64.length < 24 ||
@@ -12,17 +41,14 @@ export function parsePhotoPayload(imageBase64, declaredMimeType) {
     throw new Error("Recovery photo is invalid or exceeds the 5 MB limit.");
   }
   const bytes = Buffer.from(imageBase64, "base64");
-  if (!bytes.length || bytes.length > MAX_PHOTO_BYTES ||
-      bytes.toString("base64") !== imageBase64) {
+  if (!bytes.length || bytes.length > MAX_PHOTO_BYTES || bytes.toString("base64") !== imageBase64) {
     throw new Error("Recovery photo encoding is invalid or exceeds the 5 MB limit.");
   }
-  const jpeg = bytes.length >= 5 &&
-    bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff &&
+  const jpeg = bytes.length >= 5 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff &&
     bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9;
   const pngSignature = Buffer.from([137,80,78,71,13,10,26,10]);
   const pngEnd = Buffer.from([0,0,0,0,73,69,78,68,174,66,96,130]);
-  const png = bytes.length >= 20 &&
-    bytes.subarray(0, 8).equals(pngSignature) &&
+  const png = bytes.length >= 20 && bytes.subarray(0,8).equals(pngSignature) &&
     bytes.subarray(bytes.length - 12).equals(pngEnd);
   const mimeType = jpeg ? "image/jpeg" : png ? "image/png" : null;
   if (!mimeType || declaredMimeType !== mimeType) {
@@ -31,102 +57,58 @@ export function parsePhotoPayload(imageBase64, declaredMimeType) {
   return { bytes, mimeType, extension: mimeType === "image/png" ? "png" : "jpg" };
 }
 
-// A legacy data URL may be migrated only while it is still the current source
-// and no object-storage reference has already been committed for this device.
 export function shouldMigrateLegacyPhoto(currentState, legacyDataUrl) {
-  return Boolean(
-    currentState &&
-    !currentState.photo_object_key &&
-    typeof legacyDataUrl === "string" &&
-    legacyDataUrl.length > 0 &&
-    currentState.photo_data_url === legacyDataUrl
-  );
+  return Boolean(currentState && !currentState.photo_local_path &&
+    typeof legacyDataUrl === "string" && legacyDataUrl.length > 0 &&
+    currentState.photo_data_url === legacyDataUrl);
 }
 
-export function photoStorageConfigured() {
-  return Boolean(
-    process.env.AWS_ENDPOINT_URL_S3 &&
-    process.env.AWS_REGION &&
-    process.env.AWS_ACCESS_KEY_ID &&
-    process.env.AWS_SECRET_ACCESS_KEY &&
-    process.env.JAZZ_PHOTO_BUCKET
-  );
-}
-
-function storageClient() {
-  if (!photoStorageConfigured()) {
-    throw new Error("Private photo storage is not configured. Set the Neon S3 endpoint, region, credentials and JAZZ_PHOTO_BUCKET.");
-  }
-  const endpoint = new URL(process.env.AWS_ENDPOINT_URL_S3);
-  if (endpoint.protocol !== "https:") throw new Error("Private photo storage endpoint must use HTTPS.");
-  if (!client) {
-    client = new S3Client({
-      endpoint: endpoint.toString().replace(/\/$/, ""),
-      region: process.env.AWS_REGION,
-      forcePathStyle: true,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-      }
-    });
-  }
-  return client;
+export function localPhotoStorageReady() {
+  try { photoRoot(); return true; } catch { return false; }
 }
 
 export function currentPhotoKey(deviceId, commandId, extension) {
   if (!Number.isSafeInteger(Number(deviceId)) || Number(deviceId) < 1 ||
-      !/^[a-f0-9-]{36}$/i.test(String(commandId)) ||
-      !["jpg", "png"].includes(extension)) {
-    throw new Error("Invalid recovery photo object identity.");
+      !/^[a-f0-9-]{36}$/i.test(String(commandId)) || !["jpg", "png"].includes(extension)) {
+    throw new Error("Invalid recovery photo file identity.");
   }
-  // A unique key per upload attempt prevents concurrent retries for the same
-  // command from overwriting bytes that another request may be committing.
   return `devices/${Number(deviceId)}/${commandId}/${crypto.randomUUID()}.${extension}`;
 }
 
-export async function uploadPhotoObject({ key, bytes, mimeType }) {
-  const s3 = storageClient();
-  await s3.send(new PutObjectCommand({
-    Bucket: process.env.JAZZ_PHOTO_BUCKET,
-    Key: key,
-    Body: bytes,
-    ContentLength: bytes.length,
-    ContentType: mimeType,
-    CacheControl: "private, no-store, max-age=0",
-    Metadata: { purpose: "jazz-recovery-current-photo" }
-  }));
+export async function writePhotoFile({ key, bytes, mimeType }) {
+  const target = absolutePhotoPath(key);
+  if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > MAX_PHOTO_BYTES ||
+      !Object.values(MIME_BY_EXTENSION).includes(mimeType) ||
+      MIME_BY_EXTENSION[path.extname(target).slice(1)] !== mimeType) {
+    throw new Error("Recovery photo bytes or content type are invalid.");
+  }
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temporary = target + "." + crypto.randomUUID() + ".tmp";
+  try {
+    await fs.writeFile(temporary, bytes, { flag: "wx", mode: 0o600 });
+    await fs.rename(temporary, target);
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
   return key;
 }
 
-export async function getPhotoObject(key) {
-  if (typeof key !== "string" || !key.startsWith("devices/") || key.includes("..")) {
-    throw new Error("Invalid current photo reference.");
-  }
-  return storageClient().send(new GetObjectCommand({
-    Bucket: process.env.JAZZ_PHOTO_BUCKET,
-    Key: key
-  }));
+export async function readPhotoFile(key) {
+  const target = absolutePhotoPath(key);
+  const bytes = await fs.readFile(target);
+  if (!bytes.length || bytes.length > MAX_PHOTO_BYTES) throw new Error("Current photo file size is invalid.");
+  const mimeType = MIME_BY_EXTENSION[path.extname(target).slice(1)];
+  return { Body: { transformToByteArray: async () => new Uint8Array(bytes) }, ContentType: mimeType, bytes, mimeType };
 }
 
-export async function signedPhotoUrl(key, { download = false } = {}) {
-  if (typeof key !== "string" || !key.startsWith("devices/") || key.includes("..")) {
-    throw new Error("Invalid current photo reference.");
-  }
-  const extension = key.endsWith(".png") ? "png" : "jpg";
-  const command = new GetObjectCommand({
-    Bucket: process.env.JAZZ_PHOTO_BUCKET,
-    Key: key,
-    ResponseContentType: extension === "png" ? "image/png" : "image/jpeg",
-    ResponseCacheControl: "private, no-store, max-age=0",
-    ResponseContentDisposition: `${download ? "attachment" : "inline"}; filename="jazz-recovery-current.${extension}"`
-  });
-  return getSignedUrl(storageClient(), command, { expiresIn: 300 });
-}
-
-export async function deletePhotoObject(key) {
+export async function deletePhotoFile(key) {
   if (!key) return;
-  await storageClient().send(new DeleteObjectCommand({
-    Bucket: process.env.JAZZ_PHOTO_BUCKET,
-    Key: key
-  }));
+  await fs.rm(absolutePhotoPath(key), { force: true });
+}
+
+export async function localPhotoUrl(key, { download = false } = {}) {
+  const safeKey = safeRelativeKey(key);
+  const deviceId = safeKey.split("/")[1];
+  return `/api/devices/${deviceId}/photo-content${download ? "?download=1" : ""}`;
 }
