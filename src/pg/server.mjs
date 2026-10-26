@@ -954,13 +954,13 @@ const server = http.createServerconst server = http.createServer(async (req, res
       return json(req, res, 200, { ok: true, device: await publicDevice(row) });
     }
 
-    const photoContentMatch = path.match(/^\\/api\\/devices\\/(\\d+)\\/photo-content$/);
+    const photoContentMatch = path.match(/^\/api\/devices\/(\d+)\/photo-content$/);
     if (req.method === "GET" && photoContentMatch) {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, photoContentMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       const state = await db.prepare("SELECT photo_data_url,photo_mime_type FROM device_state WHERE device_id=?").get(row.id);
-      const match = /^data:(image\\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(state?.photo_data_url || ""));
+      const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(state?.photo_data_url || ""));
       if (!match) return json(req, res, 404, { ok: false, error: "No valid current recovery photo" });
 
       let parsed;
@@ -980,7 +980,7 @@ const server = http.createServerconst server = http.createServer(async (req, res
       return;
     }
 
-    const photoUrlMatch = path.match(/^\\/api\\/devices\\/(\\d+)\\/photo-url$/);
+    const photoUrlMatch = path.match(/^\/api\/devices\/(\d+)\/photo-url$/);
     if (req.method === "GET" && photoUrlMatch) {
       const session = await requireSession(req, res); if (!session) return;
       const row = await ownerDevice(session.user_id, photoUrlMatch[1]);
@@ -1175,8 +1175,3 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[Jazz Lost Mode] ${publicOrigins.size} browser origin(s) allowlisted; secure recovery transport active.`);
 });
 
-const photoCleanupTimer = setInterval(() => {
-  void processLocalPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup worker failed:", error?.name || "error"));
-}, 30_000);
-photoCleanupTimer.unref();
-void processLocalPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Initial photo cleanup failed:", error?.name || "error"));
