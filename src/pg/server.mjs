@@ -547,13 +547,28 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   }
 
   if (result.ok !== true || typeof result.imageBase64 !== "string") {
+    const code = String(result.status || "CAMERA_CAPTURE_FAILED")
+      .toUpperCase().replace(/[^A-Z0-9_]/g, "").slice(0, 64) || "CAMERA_CAPTURE_FAILED";
+    const knownMessages = {
+      CAMERA_PERMISSION_REQUIRED: "Camera permission is unavailable on the phone.",
+      CAMERA_CAPTURE_TIMEOUT_OR_OS_BLOCKED: "Camera capture timed out or Android blocked camera access.",
+      CAMERA_CAPTURE_OS_BLOCKED: "Android blocked camera access in the current device state.",
+      CAMERA_CAPTURE_FAILED: "The phone could not capture a photo."
+    };
+    const safeError = knownMessages[code] || knownMessages.CAMERA_CAPTURE_FAILED;
+    console.warn("[Jazz Recovery Photo]", JSON.stringify({
+      stage: "capture_failed",
+      commandId: command.id,
+      deviceId: device.id,
+      errorCode: code
+    }));
     await db.transaction(async () => {
       await db.lockDevice(device.id);
       await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'")
-        .run(JSON.stringify({ ok: false, error: "Photo capture failed" }), command.id);
+        .run(JSON.stringify({ ok: false, code, error: safeError }), command.id);
       await audit(device.user_id, device.id, "RECOVERY_PHOTO", "FAILED_CAPTURE");
     });
-    return { status: 200, body: { ok: true, photoAvailable: false } };
+    return { status: 200, body: { ok: true, photoAvailable: false, error: safeError, code } };
   }
 
   if (!photoStorageConfigured()) {
