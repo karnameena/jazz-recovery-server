@@ -202,11 +202,11 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     // Simulate a PostgreSQL write failure after a verified photo already exists.
     // The API must return failure and the transaction must roll back to the old bytes.
     await pool.query(`
-      CREATE OR REPLACE FUNCTION jazz_test_reject_photo_update() RETURNS trigger AS $
+      CREATE OR REPLACE FUNCTION jazz_test_reject_photo_update() RETURNS trigger AS $fn$
       BEGIN
         RAISE EXCEPTION 'forced photo write failure for isolated integration test';
       END;
-      $ LANGUAGE plpgsql;
+      $fn$ LANGUAGE plpgsql;
       CREATE TRIGGER jazz_test_reject_photo_update
       BEFORE UPDATE ON device_state
       FOR EACH ROW
