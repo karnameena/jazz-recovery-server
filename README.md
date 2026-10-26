@@ -13,7 +13,7 @@ Jazz Recovery's hosted API uses **Neon PostgreSQL as its only runtime database**
 
 ## Persistent data
 
-PostgreSQL stores user accounts and password hashes, recovery PIN hashes, sessions, passkey credentials and one-time WebAuthn challenges, paired devices and credential hashes, IMEI, device state, location and photo data/references, recovery commands, and audit records.
+Neon PostgreSQL stores user accounts and password hashes, recovery PIN hashes, sessions, passkey credentials and one-time WebAuthn challenges, paired devices and credential hashes, IMEI, device state, latest location and the current recovery photo bytes plus metadata, recovery commands, and audit records. The current recovery photo bytes are stored directly in Neon PostgreSQL as a single current data URL per device. A new photo is validated, written and read back inside a PostgreSQL transaction before commit; any failure rolls back and preserves the previous photo. Replacing the current photo overwrites its prior value, so no photo history is retained. No AWS S3, object storage, signed object URLs, or local photo-file storage is used.
 
 Passkey verification requires the public website origin to match `JAZZ_WEBAUTHN_ORIGIN`; `JAZZ_WEBAUTHN_RP_ID` must be that website's hostname. Keep these values aligned with the HTTPS website users actually open.
 
@@ -32,7 +32,7 @@ Set these values in the private Render environment (do not commit secrets):
 | `JAZZ_WEBAUTHN_ORIGIN` | Exact HTTPS website origin for passkeys |
 | `JAZZ_WEBAUTHN_RP_ID` | Hostname of that website, without scheme or path |
 
-Render provides `PORT`. The checked-in `render.yaml` is a staging/proposal configuration; do not deploy it to production without reviewing the service settings and explicitly approving the cutover.
+Render provides `PORT`. The checked-in `render.yaml` is a staging/proposal configuration; do not deploy it to production without reviewing the service settings and explicitly approving the cutover. Photo bytes persist in Neon PostgreSQL, not the server filesystem.
 
 ## Account recovery endpoints
 

@@ -1,17 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parsePhotoPayload, currentPhotoKey, shouldMigrateLegacyPhoto } from "../src/pg/photos.mjs";
+import { parsePhotoPayload } from "../src/pg/photos.mjs";
 
-const jpegFixture = () => Buffer.from([0xff,0xd8,0xff,...Array(18).fill(0),0xff,0xd9]);
-const pngFixture = () => Buffer.from([
-  137,80,78,71,13,10,26,10,
-  ...Array(16).fill(0),
-  0,0,0,0,73,69,78,68,174,66,96,130
-]);
+const jpegFixture = () => Buffer.from([0xff, 0xd8, 0xff, ...Array(18).fill(0), 0xff, 0xd9]);
+const pngFixture = () => Buffer.from([137,80,78,71,13,10,26,10,...Array(16).fill(0),0,0,0,0,73,69,78,68,174,66,96,130]);
 
 test("photo payload accepts JPEG and PNG with matching MIME and intact boundaries", () => {
+  assert.deepEqual(parsePhotoPayload(jpegFixture().toString("base64"), "image/jpeg").bytes, jpegFixture());
   assert.equal(parsePhotoPayload(jpegFixture().toString("base64"), "image/jpeg").mimeType, "image/jpeg");
-  assert.equal(parsePhotoPayload(pngFixture().toString("base64"), "image/png").extension, "png");
+  assert.equal(parsePhotoPayload(pngFixture().toString("base64"), "image/png").mimeType, "image/png");
 });
 
 test("photo payload rejects malformed, truncated, unsupported and MIME-mismatched data", () => {
@@ -22,30 +19,7 @@ test("photo payload rejects malformed, truncated, unsupported and MIME-mismatche
   assert.throws(() => parsePhotoPayload(jpegFixture().toString("base64"), "image/png"));
 });
 
-test("each photo upload attempt receives a unique object key", () => {
-  const id = "123e4567-e89b-12d3-a456-426614174000";
-  const first = currentPhotoKey(7, id, "jpg");
-  const second = currentPhotoKey(7, id, "jpg");
-  assert.match(first, /^devices\/7\/123e4567-e89b-12d3-a456-426614174000\/[0-9a-f-]{36}\.jpg$/i);
-  assert.notEqual(first, second);
-  assert.throws(() => currentPhotoKey(0, id, "jpg"));
-  assert.throws(() => currentPhotoKey(7, "../unsafe", "jpg"));
-});
-
-test("legacy migration never replaces an existing current object reference", () => {
-  const legacyDataUrl = "data:image/jpeg;base64,ZmFrZQ==";
-  assert.equal(
-    shouldMigrateLegacyPhoto({ photo_object_key: null, photo_data_url: legacyDataUrl }, legacyDataUrl),
-    true
-  );
-  assert.equal(
-    shouldMigrateLegacyPhoto({ photo_object_key: "devices/7/current.jpg", photo_data_url: legacyDataUrl }, legacyDataUrl),
-    false
-  );
-  assert.equal(
-    shouldMigrateLegacyPhoto({ photo_object_key: null, photo_data_url: "data:image/jpeg;base64,bmV3" }, legacyDataUrl),
-    false
-  );
-  assert.equal(shouldMigrateLegacyPhoto(null, legacyDataUrl), false);
-  assert.equal(shouldMigrateLegacyPhoto({ photo_object_key: null, photo_data_url: null }, legacyDataUrl), false);
+test("photo payload enforces the 5 MB limit", () => {
+  const tooLarge = Buffer.alloc(5 * 1024 * 1024 + 1, 1).toString("base64");
+  assert.throws(() => parsePhotoPayload(tooLarge, "image/jpeg"));
 });

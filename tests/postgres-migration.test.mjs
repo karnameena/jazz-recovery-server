@@ -167,6 +167,68 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     assert.equal(ring.status,202,"Existing ring feature still queues");
     const photo=await api("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},sessionHeaders);
     assert.equal(photo.status,202,"Existing photo feature still queues");
+
+    // Verify successful upload -> PostgreSQL commit -> authenticated photo read-back.
+    // The fixture is deliberately tiny but has the JPEG boundary bytes validated by the API.
+    const verifiedJpeg = Buffer.from([0xff,0xd8,0xff,...Array(18).fill(0),0xff,0xd9]);
+    const photoResult = await api("POST","/android/device/commands/"+photo.data.commandId+"/result",{
+      deviceId:"existing-phone",
+      result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:verifiedJpeg.toString("base64"),timestamp:Date.now()}
+    },deviceHeaders);
+    assert.equal(photoResult.status,200,"Valid recovery photo upload must be accepted");
+    assert.equal(photoResult.data.photoAvailable,true,"Photo success is returned only after database read-back verification");
+    const photoBytesResponse = await fetch(base+"/api/devices/"+id+"/photo-content",{headers:sessionHeaders,cache:"no-store"});
+    assert.equal(photoBytesResponse.status,200,"Owner must read back the saved current photo");
+    assert.equal(photoBytesResponse.headers.get("content-type"),"image/jpeg");
+    assert.deepEqual(Buffer.from(await photoBytesResponse.arrayBuffer()),verifiedJpeg,"Read-back bytes must match the latest successful upload exactly");
+
+    // A malformed replacement must fail validation without changing the committed photo.
+    const failedReplacement = await api("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},sessionHeaders);
+    assert.equal(failedReplacement.status,202);
+    const failedPhotoResult = await api("POST","/android/device/commands/"+failedReplacement.data.commandId+"/result",{
+      deviceId:"existing-phone",
+      result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:"not-valid-base64",timestamp:Date.now()}
+    },deviceHeaders);
+    assert.equal(failedPhotoResult.status,200,"Capture-validation failure is recorded as a completed command");
+    assert.equal(failedPhotoResult.data.photoAvailable,false,"Invalid replacement must not be reported as available");
+    const preservedPhotoResponse = await fetch(base+"/api/devices/"+id+"/photo-content",{headers:sessionHeaders,cache:"no-store"});
+    assert.equal(preservedPhotoResponse.status,200,"Previous verified photo must remain readable after failed replacement");
+    assert.deepEqual(Buffer.from(await preservedPhotoResponse.arrayBuffer()),verifiedJpeg,"Failed replacement must preserve previous photo bytes");
+    const storedPhoto = await pool.query("SELECT photo_data_url,photo_mime_type,photo_size_bytes FROM device_state WHERE device_id=$1",[deviceDbId]);
+    assert.equal(storedPhoto.rows[0].photo_data_url,"data:image/jpeg;base64,"+verifiedJpeg.toString("base64"));
+    assert.equal(storedPhoto.rows[0].photo_mime_type,"image/jpeg");
+    assert.equal(Number(storedPhoto.rows[0].photo_size_bytes),verifiedJpeg.length);
+
+    // Simulate a PostgreSQL write failure after a verified photo already exists.
+    // The API must return failure and the transaction must roll back to the old bytes.
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION jazz_test_reject_photo_update() RETURNS trigger AS $fn$
+      BEGIN
+        RAISE EXCEPTION 'forced photo write failure for isolated integration test';
+      END;
+      $fn$ LANGUAGE plpgsql;
+      CREATE TRIGGER jazz_test_reject_photo_update
+      BEFORE UPDATE ON device_state
+      FOR EACH ROW
+      WHEN (OLD.photo_data_url IS DISTINCT FROM NEW.photo_data_url)
+      EXECUTE FUNCTION jazz_test_reject_photo_update();
+    `);
+    try {
+      const databaseFailureReplacement = await api("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},sessionHeaders);
+      assert.equal(databaseFailureReplacement.status,202);
+      const databaseFailureResult = await api("POST","/android/device/commands/"+databaseFailureReplacement.data.commandId+"/result",{
+        deviceId:"existing-phone",
+        result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:Buffer.from([0xff,0xd8,0xff,...Array(18).fill(1),0xff,0xd9]).toString("base64"),timestamp:Date.now()}
+      },deviceHeaders);
+      assert.equal(databaseFailureResult.status,503,"Database write failure must be reported as a failed upload");
+      assert.equal(databaseFailureResult.data.photoAvailable,false);
+      const afterDatabaseFailure = await fetch(base+"/api/devices/"+id+"/photo-content",{headers:sessionHeaders,cache:"no-store"});
+      assert.equal(afterDatabaseFailure.status,200,"Previously verified photo must remain readable after a database write failure");
+      assert.deepEqual(Buffer.from(await afterDatabaseFailure.arrayBuffer()),verifiedJpeg,"Transaction rollback must preserve the previous verified photo bytes");
+    } finally {
+      await pool.query("DROP TRIGGER IF EXISTS jazz_test_reject_photo_update ON device_state");
+      await pool.query("DROP FUNCTION IF EXISTS jazz_test_reject_photo_update()");
+    }
     const voiceAudio = Buffer.alloc(46);
     voiceAudio.write("RIFF",0,"ascii");voiceAudio.write("WAVE",8,"ascii");
     voiceAudio.writeUInt16LE(1,20);voiceAudio.writeUInt16LE(1,22);
@@ -314,12 +376,14 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     const repair = await api("POST", "/api/auth/device-repair", {
       username: "recovery-owner",
       password: "ResetRecovery123!",
-      deviceId: "jazz-recovery-test",
+      // Exercise a Device ID copied with different letter case from an older screen.
+      deviceId: "JAZZ-RECOVERY-TEST",
       deviceToken: repairedToken,
       deviceName: "Recovered Test Phone",
       imei: "123456789012345"
     });
     assert.equal(repair.status, 200, "Authenticated repair must update the existing paired device without deleting its state");
+    assert.equal(repair.data.deviceId, "jazz-recovery-test", "Repair must return the canonical registered Device ID");
     const oldDeviceToken = await api("POST", "/android/device/heartbeat", {
       deviceId: "jazz-recovery-test", status: { battery: 78 }
     }, { Authorization: "Bearer " + recoveryToken, "X-Jazz-Lost-Device-Id": "jazz-recovery-test" });
