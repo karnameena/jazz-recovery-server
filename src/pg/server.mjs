@@ -642,7 +642,7 @@ async function completeRecoveryPhotoResult(device, commandId, result) {
   }));
   if (outcome.deduplicated) {
     if (outcome.currentKey !== key) await cleanupUploadedPhotoIfUnreferenced(key);
-    return { status: 200, body: { ok: true, deduplicated: true, photoAvailable: Boolean(outcome.currentKey) } };
+    return { status: 200, body: { ok: true, deduplicated: true, photoAvailable: outcome.currentKey === key } };
   }
   void processPhotoCleanupJobs().catch(error => console.error("[Jazz Lost Mode] Photo cleanup retry failed:", error?.name || "error"));
   return { status: 200, body: { ok: true, photoAvailable: true } };
