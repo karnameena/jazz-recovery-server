@@ -730,10 +730,22 @@ const server = http.createServer(async (req, res) => {
         return json(req, res, 401, { ok: false, error: "Invalid username or password." });
       }
 
-      const device = await db.prepare("SELECT * FROM devices WHERE user_id=? AND device_id=?").get(user.id, deviceId);
+      // Prefer the exact ID, then allow case-insensitive recovery for IDs copied
+      // from older UI versions. Scope every lookup to the authenticated owner.
+      let device = await db.prepare("SELECT * FROM devices WHERE user_id=? AND device_id=?").get(user.id, deviceId);
+      if (!device) {
+        const matches = await db.prepare(
+          "SELECT * FROM devices WHERE user_id=? AND LOWER(device_id)=LOWER(?) ORDER BY id LIMIT 2"
+        ).all(user.id, deviceId);
+        if (matches.length > 1) {
+          await audit(user.id, null, "DEVICE_REPAIR", "AMBIGUOUS_DEVICE_ID");
+          return json(req, res, 409, { ok: false, error: "Device ID is not unique when ignoring letter case. Copy the exact original Device ID from the website." });
+        }
+        device = matches[0] || null;
+      }
       if (!device) {
         await audit(user.id, null, "DEVICE_REPAIR", "DEVICE_NOT_OWNED");
-        return json(req, res, 404, { ok: false, error: "That existing device ID is not registered to this account." });
+        return json(req, res, 404, { ok: false, error: "That existing device ID is not registered to this account. Copy the original Device ID from the website; do not use a new installation ID." });
       }
 
       const cleanName = deviceName.slice(0, 80);
@@ -745,7 +757,7 @@ const server = http.createServer(async (req, res) => {
       }
       clearLoginFailures(ip, username);
       await audit(user.id, device.id, "DEVICE_REPAIR", "SUCCESS");
-      return json(req, res, 200, { ok: true, deviceId, message: "Existing device record re-paired. Its history and recovery state were preserved." });
+      return json(req, res, 200, { ok: true, deviceId: device.device_id, message: "Existing device record re-paired. Its history and recovery state were preserved." });
     }
 
     if (req.method === "POST" && path === "/api/auth/passkey/register/options") {
