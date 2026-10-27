@@ -82,6 +82,9 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
 
   const session=await json("POST","/api/auth/login",{username:"test-owner",password:ownerPassword});
   assert.equal(session.status,200);
+  const caseInsensitiveSession=await json("POST","/api/auth/login",{username:"TEST-OWNER",password:ownerPassword});
+  assert.equal(caseInsensitiveSession.status,200,"Existing account login should be case-insensitive");
+
   const cookie=session.cookie.split(";")[0];
   const authenticatedSession=await json("GET","/api/auth/session",undefined,{Cookie:cookie});
   assert.equal(authenticatedSession.status,200);
