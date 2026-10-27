@@ -9,7 +9,6 @@
     "change-owner-password": "node src/scripts/dispatch.mjs change-owner-password",
     "create-device": "node src/scripts/dispatch.mjs create-device",
     "rotate-device": "node src/scripts/dispatch.mjs rotate-device",
-    "start:sqlite": "node src/server.mjs",
     "pg:migrate": "node src/pg/migrate.mjs",
     "pg:import": "node src/scripts/import-sqlite-to-postgres.mjs",
     "check": "node --check src/entrypoint.mjs && node --check src/server.mjs && node --check src/pg/server.mjs && node --check src/auth/password.mjs && node --check src/pg/sessions.mjs",
