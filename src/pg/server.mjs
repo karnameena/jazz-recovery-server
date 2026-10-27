@@ -681,7 +681,7 @@ const server = http.createServer(async (req, res) => {
       } });
     }
 
-    const resultMatch = path.match(/^\\/android\\/device\\/commands\\/([a-f0-9-]+)\\/result$/i);
+    const resultMatch = path.match(/^\/android\/device\/commands\/([a-f0-9-]+)\/result$/i);
     if (req.method === "POST" && resultMatch) {
       const device = await authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
