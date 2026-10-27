@@ -5,12 +5,34 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
-import {spawn} from "node:child_process";
+import {spawn, spawnSync} from "node:child_process";
 import {DatabaseSync} from "node:sqlite";
 import {hashSecret} from "../src/auth/password.mjs";
 
 const root = path.resolve(import.meta.dirname,"..");
 const sleep = ms => new Promise(resolve=>setTimeout(resolve,ms));
+
+test("normal runtime fails closed instead of starting SQLite", () => {
+  const sqlite = spawnSync(process.execPath, ["src/entrypoint.mjs"], {
+    cwd: root,
+    env: { ...process.env, JAZZ_DB_ENGINE: "sqlite", DATABASE_URL: "" },
+    encoding: "utf8",
+    timeout: 10000
+  });
+  assert.notEqual(sqlite.status, 0);
+  assert.match(sqlite.stderr, /SQLite runtime is disabled/);
+
+  const missingUrl = spawnSync(process.execPath, ["src/entrypoint.mjs"], {
+    cwd: root,
+    env: { ...process.env, JAZZ_DB_ENGINE: "", DATABASE_URL: "" },
+    encoding: "utf8",
+    timeout: 10000
+  });
+  assert.notEqual(missingUrl.status, 0);
+  assert.match(missingUrl.stderr, /DATABASE_URL is required/);
+});
+
+
 
 async function freePort() {
   const listener=net.createServer();
