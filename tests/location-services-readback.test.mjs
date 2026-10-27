@@ -192,6 +192,57 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
   const forbiddenAction=await json("POST",actions,{action:"LOCATION_ENABLE"},otherHeaders);
   assert.equal(forbiddenAction.status,404,"Another account must not command this device");
   const existing=await json("POST",actions,{action:"RING_DEVICE"},ownerHeaders);
+
+  // Recovery-photo success/failure status and byte validation regression coverage.
+  const photoBase64="/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAAB//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EF//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EF//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAwE/EF//2Q==";
+  const jpegBytes=Buffer.from(photoBase64,"base64");
+  assert.equal(jpegBytes[0],0xff); assert.equal(jpegBytes[1],0xd8);
+  assert.equal(jpegBytes[jpegBytes.length-2],0xff); assert.equal(jpegBytes[jpegBytes.length-1],0xd9);
+  const photoQueued=await json("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},ownerHeaders);
+  assert.equal(photoQueued.status,202);
+  const photoId=photoQueued.response.commandId;
+  const photoNext=await json("GET","/android/device/commands/next",undefined,deviceHeaders);
+  assert.equal(photoNext.response.command.id,photoId);
+  const photoUpload=await json("POST","/android/device/commands/"+photoId+"/result",{
+    deviceId:"test-companion",result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:photoBase64,timestamp:Date.now()}
+  },deviceHeaders);
+  assert.equal(photoUpload.status,200);
+  const photoStatus=await json("GET","/api/devices/"+id+"/commands/"+photoId,undefined,ownerHeaders);
+  assert.equal(photoStatus.status,200,"Photo status polling must not return 404");
+  assert.equal(photoStatus.response.status,"COMPLETE");
+  assert.equal(photoStatus.response.result.ok,true);
+  assert.equal(photoStatus.response.result.imageBase64,undefined,"Status polling must not return large photo bytes");
+  const storedPhotoDb=new DatabaseSync(dbfile);
+  const storedPhoto=storedPhotoDb.prepare("SELECT photo_data_url,photo_camera FROM device_state WHERE device_id=?").get(id);
+  assert.ok(storedPhoto.photo_data_url.startsWith("data:image/jpeg;base64,"));
+  assert.equal(storedPhoto.photo_camera,"front");
+  storedPhotoDb.close();
+
+  const failedPhotoQueued=await json("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"rear"}},ownerHeaders);
+  const failedPhotoId=failedPhotoQueued.response.commandId;
+  const failedPhotoNext=await json("GET","/android/device/commands/next",undefined,deviceHeaders);
+  assert.equal(failedPhotoNext.response.command.id,failedPhotoId);
+  await json("POST","/android/device/commands/"+failedPhotoId+"/result",{
+    deviceId:"test-companion",result:{ok:false,camera:"rear",status:"CAMERA_PERMISSION_REQUIRED",error:"CAMERA_PERMISSION_REQUIRED"}
+  },deviceHeaders);
+  const failedPhotoStatus=await json("GET","/api/devices/"+id+"/commands/"+failedPhotoId,undefined,ownerHeaders);
+  assert.equal(failedPhotoStatus.response.status,"FAILED");
+  assert.equal(failedPhotoStatus.response.result.error,"CAMERA_PERMISSION_REQUIRED");
+  const afterFailedDb=new DatabaseSync(dbfile);
+  const afterFailed=afterFailedDb.prepare("SELECT photo_data_url,photo_camera FROM device_state WHERE device_id=?").get(id);
+  assert.equal(afterFailed.photo_data_url,storedPhoto.photo_data_url,"Failed capture must preserve last verified photo");
+  assert.equal(afterFailed.photo_camera,"front");
+  afterFailedDb.close();
+
+  const invalidQueued=await json("POST",actions,{action:"RECOVERY_PHOTO",args:{camera:"front"}},ownerHeaders);
+  const invalidId=invalidQueued.response.commandId;
+  await json("GET","/android/device/commands/next",undefined,deviceHeaders);
+  await json("POST","/android/device/commands/"+invalidId+"/result",{
+    deviceId:"test-companion",result:{ok:true,camera:"front",mimeType:"image/jpeg",imageBase64:"bm90LWEtanBlZw==",timestamp:Date.now()}
+  },deviceHeaders);
+  const invalidStatus=await json("GET","/api/devices/"+id+"/commands/"+invalidId,undefined,ownerHeaders);
+  assert.equal(invalidStatus.response.status,"FAILED","Invalid image bytes must not be accepted");
+  assert.equal(invalidStatus.response.result.error,"PHOTO_BYTES_INVALID");
   assert.equal(existing.status,202,"Existing ring device command must still queue");
   // Registration must work on SQLite as well as PostgreSQL, and must be atomic.
   const registeredToken=crypto.randomBytes(32).toString("base64url");
