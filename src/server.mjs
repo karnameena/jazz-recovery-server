@@ -688,12 +688,14 @@ const server = http.createServer(async (req, res) => {
       } });
     }
 
-    const resultMatch = path.match(/^\/android\/device\/commands\/([a-f0-9-]+)\/result$/i);
+    const resultMatch = path.match(/^\\/android\\/device\\/commands\\/([a-f0-9-]+)\\/result$/i);
     if (req.method === "POST" && resultMatch) {
       const device = authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
+      const body = await readJson(req, 8 * 1024 * 1024);
       const command = db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
       if (!command) return json(req, res, 404, { ok: false, error: "Unknown recovery command" });
+      let result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
       if (command.type === "recovery_photo") {
         const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
         if (result.ok === true) {
@@ -716,10 +718,10 @@ const server = http.createServer(async (req, res) => {
         if (refreshed?.status === "expired") return json(req, res, 409, { ok: false, error: "Location Services command expired" });
         if (refreshed?.status === "done") return json(req, res, 200, { ok: true, deduplicated: true });
       }
-      const body = await readJson(req, 8 * 1024 * 1024);
-      let result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
+      const storedResult = command.type === "recovery_photo" ? { ...result } : result;
+      if (command.type === "recovery_photo") delete storedResult.imageBase64;
       db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=?")
-        .run(JSON.stringify(result), command.id);
+        .run(JSON.stringify(storedResult), command.id);
       updateStateFromResult(device, command, result);
       audit(device.user_id, device.id, command.type.toUpperCase(), result.ok === false ? "FAILED" : "SUCCESS");
       return json(req, res, 200, { ok: true });
