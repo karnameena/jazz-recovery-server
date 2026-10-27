@@ -681,7 +681,7 @@ const server = http.createServer(async (req, res) => {
       } });
     }
 
-    const resultMatch = path.match(/^\/android\/device\/commands\/([a-f0-9-]+)\/result$/i);
+    const resultMatch = path.match(/^\\/android\\/device\\/commands\\/([a-f0-9-]+)\\/result$/i);
     if (req.method === "POST" && resultMatch) {
       const device = await authenticateDevice(req);
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
@@ -689,35 +689,37 @@ const server = http.createServer(async (req, res) => {
       let result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
       const response = await db.transaction(async () => {
         await db.lockDevice(device.id);
-      const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
-      if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
-      if (command.type === "recovery_photo") {
-        const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
-        if (result.ok === true) {
-          const encoded = typeof result.imageBase64 === "string" ? result.imageBase64 : "";
-          const validBase64 = encoded.length > 0 && encoded.length <= 10 * 1024 * 1024 && /^[A-Za-z0-9+/]+={0,2}$/.test(encoded);
-          let bytes = Buffer.alloc(0);
-          if (validBase64) { try { bytes = Buffer.from(encoded, "base64"); } catch {} }
-          const validJpeg = bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 &&
-            bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9;
-          if (result.camera !== requestedCamera) result = { ok: false, error: "CAMERA_MISMATCH", camera: result.camera || null };
-          else if (result.mimeType !== "image/jpeg" || !validBase64 || !validJpeg)
-            result = { ok: false, error: "PHOTO_BYTES_INVALID", camera: requestedCamera };
-        } else {
-          result = { ok: false, error: String(result.error || result.status || "PHOTO_CAPTURE_FAILED").slice(0, 160), camera: result.camera || requestedCamera };
+        const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
+        if (!command) return { status: 404, body: { ok: false, error: "Unknown recovery command" } };
+        if (command.type === "recovery_photo") {
+          const requestedCamera = JSON.parse(command.args_json || "{}").camera === "rear" ? "rear" : "front";
+          if (result.ok === true) {
+            const encoded = typeof result.imageBase64 === "string" ? result.imageBase64 : "";
+            const validBase64 = encoded.length > 0 && encoded.length <= 10 * 1024 * 1024 && /^[A-Za-z0-9+/]+={0,2}$/.test(encoded);
+            let bytes = Buffer.alloc(0);
+            if (validBase64) { try { bytes = Buffer.from(encoded, "base64"); } catch {} }
+            const validJpeg = bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 &&
+              bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9;
+            if (result.camera !== requestedCamera) result = { ok: false, error: "CAMERA_MISMATCH", camera: result.camera || null };
+            else if (result.mimeType !== "image/jpeg" || !validBase64 || !validJpeg)
+              result = { ok: false, error: "PHOTO_BYTES_INVALID", camera: requestedCamera };
+          } else {
+            result = { ok: false, error: String(result.error || result.status || "PHOTO_CAPTURE_FAILED").slice(0, 160), camera: result.camera || requestedCamera };
+          }
         }
-      }
-      if (LOCATION_COMMANDS.has(command.type)) {
-        await expireLocationCommands(device.id);
-        const refreshed = await db.prepare("SELECT status FROM recovery_commands WHERE id=?").get(command.id);
-        if (refreshed?.status === "expired") return { status: 409, body: { ok: false, error: "Location Services command expired" } };
-        if (refreshed?.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
-      }
-      await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=?")
-        .run(JSON.stringify(result), command.id);
-      await updateStateFromResult(device, command, result);
-      await audit(device.user_id, device.id, command.type.toUpperCase(), result.ok === false ? "FAILED" : "SUCCESS");
-      return { status: 200, body: { ok: true } };
+        if (LOCATION_COMMANDS.has(command.type)) {
+          await expireLocationCommands(device.id);
+          const refreshed = await db.prepare("SELECT status FROM recovery_commands WHERE id=?").get(command.id);
+          if (refreshed?.status === "expired") return { status: 409, body: { ok: false, error: "Location Services command expired" } };
+          if (refreshed?.status === "done") return { status: 200, body: { ok: true, deduplicated: true } };
+        }
+        const storedResult = command.type === "recovery_photo" ? { ...result } : result;
+        if (command.type === "recovery_photo") delete storedResult.imageBase64;
+        await db.prepare("UPDATE recovery_commands SET status='done',result_json=?,completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=?")
+          .run(JSON.stringify(storedResult), command.id);
+        await updateStateFromResult(device, command, result);
+        await audit(device.user_id, device.id, command.type.toUpperCase(), result.ok === false ? "FAILED" : "SUCCESS");
+        return { status: 200, body: { ok: true } };
       });
       return json(req, res, response.status, response.body);
     }
