@@ -3,7 +3,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [feature/recovery-enrollment-neon-20261020, feature/recovery-quality-fixes-20261023]
+    branches: [feature/recovery-enrollment-neon-20261020, feature/recovery-quality-fixes-20261023, repair/postgres-photo-login-20261027]
 permissions:
   contents: read
 jobs:
