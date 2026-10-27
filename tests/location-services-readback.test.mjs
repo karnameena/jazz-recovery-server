@@ -196,6 +196,8 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
   assert.equal(forbiddenAction.status,404,"Another account must not command this device");
   const existing=await json("POST",actions,{action:"RING_DEVICE"},ownerHeaders);
   assert.equal(existing.status,202,"Existing ring device command must still queue");
+  const existingNext=await json("GET","/android/device/commands/next",undefined,deviceHeaders);
+  assert.equal(existingNext.response.command.type,"ring_device","Drain the earlier ring command before testing photo delivery");
 
   // Recovery-photo success/failure status and byte validation regression coverage.
   const photoBase64="/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAAB//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EF//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EF//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAwE/EF//2Q==";
