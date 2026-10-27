@@ -215,6 +215,10 @@ test("authenticated Lost Mode heartbeat reports real location toggle status with
   assert.equal(photoStatus.response.status,"COMPLETE");
   assert.equal(photoStatus.response.result.ok,true);
   assert.equal(photoStatus.response.result.imageBase64,undefined,"Status polling must not return large photo bytes");
+  const commandResultDb=new DatabaseSync(dbfile);
+  const storedCommandResult=commandResultDb.prepare("SELECT result_json FROM recovery_commands WHERE id=?").get(photoId);
+  assert.equal(JSON.parse(storedCommandResult.result_json).imageBase64,undefined,"Command history must not retain historical photo bytes");
+  commandResultDb.close();
   const storedPhotoDb=new DatabaseSync(dbfile);
   const storedPhoto=storedPhotoDb.prepare("SELECT photo_data_url,photo_camera FROM device_state WHERE device_id=?").get(id);
   assert.ok(storedPhoto.photo_data_url.startsWith("data:image/jpeg;base64,"));
