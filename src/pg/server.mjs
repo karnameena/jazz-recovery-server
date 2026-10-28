@@ -1124,7 +1124,7 @@ const server = http.createServer(async (req, res) => {
       const now = Date.now();
       if (tokens.length < 1 || tokens.length > 20 || !Number.isSafeInteger(expiresAtMs) ||
           expiresAtMs <= now || expiresAtMs > now + 600000 ||
-          tokens.some(t => typeof t !== "string" || !/^[A-Za-z0-9_-]{22,128}$/.test(t))) {
+          tokens.some(t => typeof t !== "string" || !/^[A-Za-z0-9_-]{14,128}$/.test(t))) {
         return json(req, res, 400, { ok: false, error: "Invalid short-lived beacon token batch" });
       }
       await db.transaction(async () => {
@@ -1151,8 +1151,8 @@ const server = http.createServer(async (req, res) => {
       const accuracy = Number(body.accuracyMeters);
       const rssi = Number(body.rssi);
       const now = Date.now();
-      if (!/^[0-9a-f-]{36}$/i.test(reportId) || !/^[A-Za-z0-9_-]{22,128}$/.test(beaconToken) ||
-          !Number.isSafeInteger(observedAtMs) || observedAtMs < now - 120000 || observedAtMs > now + 30000 ||
+      if (!/^[0-9a-f-]{36}$/i.test(reportId) || !/^[A-Za-z0-9_-]{14,128}$/.test(beaconToken) ||
+          !Number.isSafeInteger(observedAtMs) || observedAtMs < now - 600000 || observedAtMs > now + 30000 ||
           !Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
           !Number.isFinite(longitude) || longitude < -180 || longitude > 180 ||
           !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 100000 ||
