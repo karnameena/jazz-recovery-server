@@ -413,7 +413,7 @@ async function resolveCellPosition(result) {
     Number.isInteger(t.mobileNetworkCode) && t.mobileNetworkCode >= 0 && t.mobileNetworkCode <= 999 &&
     Number.isFinite(t.signalStrength) && t.signalStrength >= -160 && t.signalStrength <= 0 &&
     (t.radioType === "nr"
-      ? Number.isSafeInteger(t.newRadioCellId) && t.newRadioCellId > 0
+      ? Number.isSafeInteger(t.newRadioCellId) && t.newRadioCellId >= 0 && t.newRadioCellId <= 68719476735
       : Number.isSafeInteger(t.cellId) && t.cellId >= 0) &&
     (t.radioType === "cdma" || Number.isInteger(t.locationAreaCode))
   ).slice(0, 16);
@@ -422,25 +422,39 @@ async function resolveCellPosition(result) {
   result.locations = locations;
   if (!towers.length) {
     locations.push({ source: "CELLULAR", status: "NO_VALID_CELL_MEASUREMENTS" });
+    if (result.ok !== true) result.error = "CELL_INFO_UNAVAILABLE";
     return result;
   }
-  const googleKey = String(process.env.JAZZ_GOOGLE_GEOLOCATION_API_KEY || "").trim();
-  const providers = [];
-  if (googleKey) providers.push({
-    source: "CELLULAR_GOOGLE",
-    url: "https://www.googleapis.com/geolocation/v1/geolocate?key=" + encodeURIComponent(googleKey),
-    body: { cellTowers: towers, considerIp: false }
-  });
-  providers.push({
+  const providers = [{
     source: "CELLULAR_BEACONDB",
     url: "https://api.beacondb.net/v1/geolocate",
-    body: { cellTowers: towers, considerIp: false }
-  });
+    body: { cellTowers: towers, considerIp: false, fallbacks: { lacf: true, ipf: false } }
+  }];
+  const googleKey = String(process.env.JAZZ_GOOGLE_GEOLOCATION_API_KEY || "").trim();
+  if (googleKey) {
+    const byRadio = new Map();
+    for (const tower of towers) {
+      const group = byRadio.get(tower.radioType) || [];
+      group.push(tower);
+      byRadio.set(tower.radioType, group);
+    }
+    for (const [radioType, group] of byRadio) {
+      providers.push({
+        source: "CELLULAR_GOOGLE",
+        url: "https://www.googleapis.com/geolocation/v1/geolocate?key=" + encodeURIComponent(googleKey),
+        body: {
+          radioType,
+          considerIp: false,
+          cellTowers: group.map(({ radioType: ignored, ...tower }) => tower)
+        }
+      });
+    }
+  }
   for (const provider of providers) {
     try {
       const response = await fetch(provider.url, {
         method: "POST",
-        headers: { "content-type": "application/json", "user-agent": "JazzRecovery/1.0 (cellular location; opt-in recovery)" },
+        headers: { "content-type": "application/json", "user-agent": "JazzRecovery/1.0 (opt-in cellular location)" },
         body: JSON.stringify(provider.body),
         signal: AbortSignal.timeout(6000)
       });
@@ -449,6 +463,11 @@ async function resolveCellPosition(result) {
         continue;
       }
       const body = await response.json();
+      // Refuse IP-derived estimates; this feature must be based on actual cell measurements.
+      if (body?.fallback === "ipf") {
+        locations.push({ source: provider.source, status: "IP_FALLBACK_REJECTED" });
+        continue;
+      }
       const latitude = Number(body?.location?.lat);
       const longitude = Number(body?.location?.lng);
       const accuracy = Number(body?.accuracy);
@@ -461,8 +480,7 @@ async function resolveCellPosition(result) {
       const cell = { source: provider.source, status: "SUCCESS", latitude, longitude,
         accuracyMeters: accuracy, timestamp: Date.now(), fresh: true };
       locations.push(cell);
-      // A provider result takes priority over cached location, but never overwrites
-      // an already successful fresh GPS/fused result selected by this command.
+      // A cell estimate supersedes a cached location, never a fresh GPS/fused fix.
       if (result.source === "LAST_KNOWN" || result.ok !== true) {
         Object.assign(result, { ok: true, latitude, longitude, accuracyMeters: accuracy,
           timestamp: cell.timestamp, source: provider.source, fresh: true });
