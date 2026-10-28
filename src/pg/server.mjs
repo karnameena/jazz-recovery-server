@@ -406,9 +406,22 @@ async function updateStateFromResult(device, command, result) {
       locationServicesState(status.locationServices) === "UNKNOWN" ? null : (Number(status.locationServicesTimestamp) || Date.now()),
       device.id);
   }
-  if (command.type === "device_location" && result.ok) {
-    await db.prepare(`UPDATE device_state SET latitude=?,longitude=?,accuracy_meters=?,location_timestamp=?,battery=COALESCE(?,battery),network=COALESCE(?,network),last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE device_id=?`)
-      .run(result.latitude, result.longitude, result.accuracyMeters ?? null, result.timestamp ?? Date.now(), result.statusSnapshot?.battery ?? null, result.statusSnapshot?.network ?? null, device.id);
+  if (command.type === "device_location" && result.ok === true) {
+    const latitude = Number(result.latitude);
+    const longitude = Number(result.longitude);
+    const timestamp = Number(result.timestamp);
+    const accuracy = result.accuracyMeters == null ? null : Number(result.accuracyMeters);
+    const validCoordinates = Number.isFinite(latitude) && Number.isFinite(longitude) &&
+      latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180;
+    const validTimestamp = Number.isSafeInteger(timestamp) && timestamp > 0 &&
+      timestamp <= Date.now() + 60_000;
+    const validAccuracy = accuracy == null || (Number.isFinite(accuracy) && accuracy >= 0);
+    if (validCoordinates && validTimestamp && validAccuracy) {
+      // A delayed response must never replace a newer accepted location.
+      await db.prepare(`UPDATE device_state SET latitude=?,longitude=?,accuracy_meters=?,location_timestamp=?,battery=COALESCE(?,battery),network=COALESCE(?,network),last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE device_id=? AND (location_timestamp IS NULL OR location_timestamp < ?)`)
+        .run(latitude, longitude, accuracy, timestamp, result.statusSnapshot?.battery ?? null,
+          result.statusSnapshot?.network ?? null, device.id, timestamp);
+    }
   }
   if (LOCATION_COMMANDS.has(command.type) && result.ok === true &&
       (command.type === "location_status" ? ["ON","OFF"].includes(result.locationServices) :
