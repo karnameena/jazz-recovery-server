@@ -31,3 +31,14 @@ CREATE TABLE IF NOT EXISTS location_helper_reports (
 
 CREATE INDEX IF NOT EXISTS location_helper_reports_target_received_idx
   ON location_helper_reports(target_device_id, received_at DESC);
+
+CREATE TABLE IF NOT EXISTS location_helper_beacon_tokens (
+  target_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  token_hash CHAR(64) NOT NULL,
+  expires_at_ms BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (target_device_id, token_hash)
+);
+
+CREATE INDEX IF NOT EXISTS location_helper_beacon_tokens_expiry_idx
+  ON location_helper_beacon_tokens(target_device_id, expires_at_ms);
