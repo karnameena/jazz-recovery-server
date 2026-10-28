@@ -42,3 +42,18 @@ CREATE TABLE IF NOT EXISTS location_helper_beacon_tokens (
 
 CREATE INDEX IF NOT EXISTS location_helper_beacon_tokens_expiry_idx
   ON location_helper_beacon_tokens(target_device_id, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS location_beacon_settings (
+  target_device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS location_helper_token_uses (
+  target_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  helper_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  token_hash CHAR(64) NOT NULL,
+  used_at_ms BIGINT NOT NULL,
+  PRIMARY KEY (target_device_id, helper_device_id, token_hash)
+);
