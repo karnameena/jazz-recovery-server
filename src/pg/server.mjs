@@ -235,6 +235,7 @@ function locationServicesState(value) {
 
 async function publicDevice(row) {
   const state = (await stateFor(row.id)) || {};
+  const helperReport = await db.prepare("SELECT helper_device_id,observed_at_ms,latitude,longitude,accuracy_meters,rssi,received_at FROM location_helper_reports WHERE target_device_id=? ORDER BY observed_at_ms DESC LIMIT 1").get(row.id);
   const latestLocationCommand = await db.prepare("SELECT result_json FROM recovery_commands WHERE device_id=? AND type='device_location' AND status='done' ORDER BY completed_at DESC,id DESC LIMIT 1").get(row.id);
   let locationResult = null;
   try { locationResult = latestLocationCommand?.result_json ? JSON.parse(latestLocationCommand.result_json) : null; } catch { locationResult = null; }
