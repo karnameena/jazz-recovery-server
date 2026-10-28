@@ -1124,6 +1124,13 @@ const server = http.createServer(async (req, res) => {
       }
       await db.prepare("INSERT INTO location_helper_authorizations(target_device_id,helper_device_id,owner_user_id,enabled,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(target_device_id,helper_device_id) DO UPDATE SET owner_user_id=EXCLUDED.owner_user_id,enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP")
         .run(target.id, helper.id, target.user_id, enabled);
+      if (!enabled) {
+        const remaining = await db.prepare("SELECT COUNT(*) AS total FROM location_helper_authorizations WHERE target_device_id=? AND enabled=TRUE").get(target.id);
+        if (Number(remaining?.total || 0) === 0) {
+          await db.prepare("UPDATE location_beacon_settings SET enabled=FALSE,updated_at=CURRENT_TIMESTAMP WHERE target_device_id=?").run(target.id);
+          await db.prepare("DELETE FROM location_helper_beacon_tokens WHERE target_device_id=?").run(target.id);
+        }
+      }
       await audit(target.user_id, target.id, "LOCATION_HELPER_AUTHORIZATION", enabled ? "ENABLED" : "DISABLED");
       return json(req, res, 200, { ok: true, helperDeviceId, enabled });
     }
