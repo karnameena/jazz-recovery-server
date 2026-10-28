@@ -235,6 +235,9 @@ function locationServicesState(value) {
 
 async function publicDevice(row) {
   const state = (await stateFor(row.id)) || {};
+  const latestLocationCommand = await db.prepare("SELECT result_json FROM recovery_commands WHERE device_id=? AND type='device_location' AND status='done' ORDER BY completed_at DESC,id DESC LIMIT 1").get(row.id);
+  let locationResult = null;
+  try { locationResult = latestLocationCommand?.result_json ? JSON.parse(latestLocationCommand.result_json) : null; } catch { locationResult = null; }
   return {
     id: row.id,
     deviceId: row.device_id,
@@ -255,6 +258,9 @@ async function publicDevice(row) {
       accuracyMeters: state.accuracy_meters,
       timestamp: state.location_timestamp
     },
+    locationResults: Array.isArray(locationResult?.locations) ? locationResult.locations : [],
+    locationSource: typeof locationResult?.source === "string" ? locationResult.source : null,
+    locationFresh: typeof locationResult?.fresh === "boolean" ? locationResult.fresh : null,
     photo: state.photo_data_url ? {
       dataUrl: state.photo_data_url,
       camera: state.photo_camera,
