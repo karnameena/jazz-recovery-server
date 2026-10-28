@@ -266,7 +266,8 @@ async function publicDevice(row) {
         status: Date.now() - Number(helperReport.observed_at_ms) <= 10 * 60_000 ? "SUCCESS" : "STALE",
         latitude: helperReport.latitude,
         longitude: helperReport.longitude,
-        accuracyMeters: helperReport.accuracy_meters,
+        accuracyMeters: null,
+        helperAccuracyMeters: helperReport.accuracy_meters,
         timestamp: Number(helperReport.observed_at_ms),
         estimated: true
       }] : [])
@@ -1221,7 +1222,7 @@ const server = http.createServer(async (req, res) => {
       await audit(helper.user_id, target.id, "LOCATION_HELPER_REPORT", "ACCEPTED");
       return json(req, res, 200, { ok: true, source: "BLE_HELPER_PROXIMITY_ESTIMATE",
         estimated: true, exactTargetLocation: false, latitude, longitude,
-        accuracyMeters: accuracy, rssi, observedAtMs, helperDeviceId: helper.device_id });
+        accuracyMeters: null, helperAccuracyMeters: accuracy, rssi, observedAtMs });
     }
 
     if (req.method === "POST" && path === "/android/device/heartbeat") {
