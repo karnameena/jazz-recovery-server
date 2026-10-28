@@ -438,31 +438,12 @@ async function resolveCellPosition(result) {
     if (result.ok !== true) result.error = "CELL_INFO_UNAVAILABLE";
     return result;
   }
+  // Open-data-only policy: never call proprietary or billable geolocation APIs.
   const providers = [{
     source: "CELLULAR_BEACONDB",
     url: "https://api.beacondb.net/v1/geolocate",
     body: { cellTowers: towers, considerIp: false, fallbacks: { lacf: true, ipf: false } }
   }];
-  const googleKey = String(process.env.JAZZ_GOOGLE_GEOLOCATION_API_KEY || "").trim();
-  if (googleKey) {
-    const byRadio = new Map();
-    for (const tower of towers) {
-      const group = byRadio.get(tower.radioType) || [];
-      group.push(tower);
-      byRadio.set(tower.radioType, group);
-    }
-    for (const [radioType, group] of byRadio) {
-      providers.push({
-        source: "CELLULAR_GOOGLE",
-        url: "https://www.googleapis.com/geolocation/v1/geolocate?key=" + encodeURIComponent(googleKey),
-        body: {
-          radioType,
-          considerIp: false,
-          cellTowers: group.map(({ radioType: ignored, ...tower }) => tower)
-        }
-      });
-    }
-  }
   for (const provider of providers) {
     try {
       const response = await fetch(provider.url, {
