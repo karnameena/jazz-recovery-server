@@ -258,7 +258,18 @@ async function publicDevice(row) {
       accuracyMeters: state.accuracy_meters,
       timestamp: state.location_timestamp
     },
-    locationResults: Array.isArray(locationResult?.locations) ? locationResult.locations : [],
+    locationResults: [
+      ...(Array.isArray(locationResult?.locations) ? locationResult.locations : []),
+      ...(helperReport ? [{
+        source: "BLE_HELPER_PROXIMITY_ESTIMATE",
+        status: Date.now() - Number(helperReport.observed_at_ms) <= 10 * 60_000 ? "SUCCESS" : "STALE",
+        latitude: helperReport.latitude,
+        longitude: helperReport.longitude,
+        accuracyMeters: helperReport.accuracy_meters,
+        timestamp: Number(helperReport.observed_at_ms),
+        estimated: true
+      }] : [])
+    ],
     locationSource: typeof locationResult?.source === "string" ? locationResult.source : null,
     locationFresh: typeof locationResult?.fresh === "boolean" ? locationResult.fresh : null,
     photo: state.photo_data_url ? {
