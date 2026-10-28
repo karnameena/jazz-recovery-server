@@ -1086,12 +1086,39 @@ const server = http.createServer(async (req, res) => {
       return json(req, res, 200, { ok: true, helperDeviceId, enabled });
     }
 
+    if (req.method === "POST" && path === "/android/device/location-helper/consent") {
+      const helper = await authenticateDevice(req);
+      if (!helper) return json(req, res, 401, { ok: false, error: "Unauthorized helper device" });
+      const body = await readJson(req, 4096);
+      const enabled = body.enabled === true;
+      await db.prepare("INSERT INTO location_helper_consents(helper_device_id,user_id,enabled,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(helper_device_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP")
+        .run(helper.id, helper.user_id, enabled);
+      await audit(helper.user_id, helper.id, "LOCATION_HELPER_CONSENT", enabled ? "ENABLED" : "DISABLED");
+      return json(req, res, 200, { ok: true, enabled });
+    }
+
+    if (req.method === "POST" && path === "/android/device/location-helper/beacon-setting") {
+      const target = await authenticateDevice(req);
+      if (!target) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
+      const body = await readJson(req, 4096);
+      const enabled = body.enabled === true;
+      if (enabled) {
+        const authorized = await db.prepare("SELECT COUNT(*) AS total FROM location_helper_authorizations WHERE target_device_id=? AND enabled=TRUE").get(target.id);
+        if (Number(authorized?.total || 0) < 1) return json(req, res, 409, { ok: false, error: "Authorize at least one opted-in helper before enabling beacon broadcasting" });
+      }
+      await db.prepare("INSERT INTO location_beacon_settings(target_device_id,user_id,enabled,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(target_device_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP")
+        .run(target.id, target.user_id, enabled);
+      await audit(target.user_id, target.id, "LOCATION_BEACON_SETTING", enabled ? "ENABLED" : "DISABLED");
+      return json(req, res, 200, { ok: true, enabled });
+    }
+
     if (req.method === "POST" && path === "/android/device/location-helper/beacon-tokens") {
       const target = await authenticateDevice(req);
       if (!target) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
       const body = await readJson(req, 16 * 1024);
+      const beaconSetting = await db.prepare("SELECT enabled FROM location_beacon_settings WHERE target_device_id=? AND user_id=?").get(target.id, target.user_id);
       const authorized = await db.prepare("SELECT COUNT(*) AS total FROM location_helper_authorizations WHERE target_device_id=? AND enabled=TRUE").get(target.id);
-      if (Number(authorized?.total || 0) < 1) return json(req, res, 403, { ok: false, error: "No authorized location helpers" });
+      if (!beaconSetting?.enabled || Number(authorized?.total || 0) < 1) return json(req, res, 403, { ok: false, error: "Location beacon is not enabled or no helpers are authorized" });
       const tokens = Array.isArray(body.tokens) ? body.tokens : [];
       const expiresAtMs = Number(body.expiresAtMs);
       const now = Date.now();
@@ -1132,19 +1159,25 @@ const server = http.createServer(async (req, res) => {
           !Number.isInteger(rssi) || rssi < -127 || rssi > 0) {
         return json(req, res, 400, { ok: false, error: "Invalid or stale helper report" });
       }
-      const target = await db.prepare("SELECT id,user_id FROM devices WHERE device_id=?").get(targetDeviceId);
-      if (!target) return json(req, res, 404, { ok: false, error: "Target device not found" });
+      const tokenHash = crypto.createHash("sha256").update(beaconToken).digest("hex");
+      const tokenQuery = targetDeviceId
+        ? await db.prepare("SELECT t.target_device_id,d.user_id FROM location_helper_beacon_tokens t JOIN devices d ON d.id=t.target_device_id WHERE d.device_id=? AND t.token_hash=? AND t.expires_at_ms>=?").get(targetDeviceId, tokenHash, now)
+        : await db.prepare("SELECT t.target_device_id,d.user_id FROM location_helper_beacon_tokens t JOIN devices d ON d.id=t.target_device_id WHERE t.token_hash=? AND t.expires_at_ms>=? LIMIT 1").get(tokenHash, now);
+      if (!tokenQuery) return json(req, res, 403, { ok: false, error: "Beacon proof is invalid or expired" });
+      const target = { id: tokenQuery.target_device_id, user_id: tokenQuery.user_id };
       const authorization = await db.prepare("SELECT enabled FROM location_helper_authorizations WHERE target_device_id=? AND helper_device_id=? AND owner_user_id=?").get(target.id, helper.id, target.user_id);
       const helperConsent = await db.prepare("SELECT enabled FROM location_helper_consents WHERE helper_device_id=? AND user_id=?").get(helper.id, helper.user_id);
-      if (!authorization?.enabled || !helperConsent?.enabled) return json(req, res, 403, { ok: false, error: "Helper is not authorized or has not opted in" });
-      const tokenHash = crypto.createHash("sha256").update(beaconToken).digest("hex");
-      const validToken = await db.prepare("SELECT expires_at_ms FROM location_helper_beacon_tokens WHERE target_device_id=? AND token_hash=? AND expires_at_ms>=?").get(target.id, tokenHash, now);
-      if (!validToken) return json(req, res, 403, { ok: false, error: "Beacon proof is invalid or expired" });
+      const beaconSetting = await db.prepare("SELECT enabled FROM location_beacon_settings WHERE target_device_id=? AND user_id=?").get(target.id, target.user_id);
+      if (!authorization?.enabled || !helperConsent?.enabled || !beaconSetting?.enabled) return json(req, res, 403, { ok: false, error: "Helper or target is not opted in and authorized" });
+      const tokenUse = await db.prepare("SELECT used_at_ms FROM location_helper_token_uses WHERE target_device_id=? AND helper_device_id=? AND token_hash=?").get(target.id, helper.id, tokenHash);
+      if (tokenUse) return json(req, res, 409, { ok: false, error: "Beacon token was already used by this helper" });
       try {
         const previous = await db.prepare("SELECT report_id,observed_at_ms FROM location_helper_reports WHERE target_device_id=? AND helper_device_id=?").get(target.id, helper.id);
         if (previous && Number(previous.observed_at_ms) >= observedAtMs) return json(req, res, 409, { ok: false, error: "Duplicate or stale helper report" });
         await db.prepare("INSERT INTO location_helper_reports(target_device_id,helper_device_id,report_id,observed_at_ms,latitude,longitude,accuracy_meters,rssi) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(target_device_id,helper_device_id) DO UPDATE SET report_id=EXCLUDED.report_id,observed_at_ms=EXCLUDED.observed_at_ms,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,accuracy_meters=EXCLUDED.accuracy_meters,rssi=EXCLUDED.rssi,received_at=CURRENT_TIMESTAMP WHERE location_helper_reports.observed_at_ms<EXCLUDED.observed_at_ms")
           .run(target.id, helper.id, reportId, observedAtMs, latitude, longitude, accuracy, rssi);
+        await db.prepare("INSERT INTO location_helper_token_uses(target_device_id,helper_device_id,token_hash,used_at_ms) VALUES(?,?,?,?)")
+          .run(target.id, helper.id, tokenHash, now);
       } catch (error) {
         if (error?.code === "23505") return json(req, res, 409, { ok: false, error: "Replayed helper report" });
         throw error;
