@@ -1198,15 +1198,21 @@ const server = http.createServer(async (req, res) => {
       const helperConsent = await db.prepare("SELECT enabled FROM location_helper_consents WHERE helper_device_id=? AND user_id=?").get(helper.id, helper.user_id);
       const beaconSetting = await db.prepare("SELECT enabled FROM location_beacon_settings WHERE target_device_id=? AND user_id=?").get(target.id, target.user_id);
       if (!authorization?.enabled || !helperConsent?.enabled || !beaconSetting?.enabled) return json(req, res, 403, { ok: false, error: "Helper or target is not opted in and authorized" });
-      const tokenUse = await db.prepare("SELECT used_at_ms FROM location_helper_token_uses WHERE target_device_id=? AND helper_device_id=? AND token_hash=?").get(target.id, helper.id, tokenHash);
-      if (tokenUse) return json(req, res, 409, { ok: false, error: "Beacon token was already used by this helper" });
       try {
-        const previous = await db.prepare("SELECT report_id,observed_at_ms FROM location_helper_reports WHERE target_device_id=? AND helper_device_id=?").get(target.id, helper.id);
-        if (previous && Number(previous.observed_at_ms) >= observedAtMs) return json(req, res, 409, { ok: false, error: "Duplicate or stale helper report" });
-        await db.prepare("INSERT INTO location_helper_reports(target_device_id,helper_device_id,report_id,observed_at_ms,latitude,longitude,accuracy_meters,rssi) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(target_device_id,helper_device_id) DO UPDATE SET report_id=EXCLUDED.report_id,observed_at_ms=EXCLUDED.observed_at_ms,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,accuracy_meters=EXCLUDED.accuracy_meters,rssi=EXCLUDED.rssi,received_at=CURRENT_TIMESTAMP WHERE location_helper_reports.observed_at_ms<EXCLUDED.observed_at_ms")
-          .run(target.id, helper.id, reportId, observedAtMs, latitude, longitude, accuracy, rssi);
-        await db.prepare("INSERT INTO location_helper_token_uses(target_device_id,helper_device_id,token_hash,used_at_ms) VALUES(?,?,?,?)")
-          .run(target.id, helper.id, tokenHash, now);
+        const outcome = await db.transaction(async () => {
+          await db.lockDevice(target.id);
+          const tokenUse = await db.prepare("SELECT used_at_ms FROM location_helper_token_uses WHERE target_device_id=? AND helper_device_id=? AND token_hash=?").get(target.id, helper.id, tokenHash);
+          if (tokenUse) return "TOKEN_USED";
+          const previous = await db.prepare("SELECT report_id,observed_at_ms FROM location_helper_reports WHERE target_device_id=? AND helper_device_id=?").get(target.id, helper.id);
+          if (previous && Number(previous.observed_at_ms) >= observedAtMs) return "STALE";
+          await db.prepare("INSERT INTO location_helper_token_uses(target_device_id,helper_device_id,token_hash,used_at_ms) VALUES(?,?,?,?)")
+            .run(target.id, helper.id, tokenHash, now);
+          await db.prepare("INSERT INTO location_helper_reports(target_device_id,helper_device_id,report_id,observed_at_ms,latitude,longitude,accuracy_meters,rssi) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(target_device_id,helper_device_id) DO UPDATE SET report_id=EXCLUDED.report_id,observed_at_ms=EXCLUDED.observed_at_ms,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,accuracy_meters=EXCLUDED.accuracy_meters,rssi=EXCLUDED.rssi,received_at=CURRENT_TIMESTAMP WHERE location_helper_reports.observed_at_ms<EXCLUDED.observed_at_ms")
+            .run(target.id, helper.id, reportId, observedAtMs, latitude, longitude, accuracy, rssi);
+          return "OK";
+        });
+        if (outcome === "TOKEN_USED") return json(req, res, 409, { ok: false, error: "Beacon token was already used by this helper" });
+        if (outcome === "STALE") return json(req, res, 409, { ok: false, error: "Duplicate or stale helper report" });
       } catch (error) {
         if (error?.code === "23505") return json(req, res, 409, { ok: false, error: "Replayed helper report" });
         throw error;
