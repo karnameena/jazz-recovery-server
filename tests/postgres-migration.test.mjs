@@ -200,6 +200,35 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     },tabletAuth);
     assert.equal(tabletHeartbeat.status,200,"Tablet credential must authenticate independently");
 
+    const helperConsent = await api("POST", "/android/device/location-helper/consent", { enabled: true }, tabletAuth);
+    assert.equal(helperConsent.status, 200, "A helper device must explicitly opt in");
+    const helperAuthorization = await api("POST", "/android/device/location-helper/authorize", {
+      helperDeviceId: "jazz-tablet-01", enabled: true
+    }, deviceHeaders);
+    assert.equal(helperAuthorization.status, 200, "Target device owner must authorize the helper");
+    const beaconSetting = await api("POST", "/android/device/location-helper/beacon-setting", { enabled: true }, deviceHeaders);
+    assert.equal(beaconSetting.status, 200, "Target beacon requires explicit opt-in");
+    const beaconToken = crypto.randomBytes(10).toString("base64url");
+    const tokenBatch = await api("POST", "/android/device/location-helper/beacon-tokens", {
+      tokens: [beaconToken], expiresAtMs: Date.now() + 600000
+    }, deviceHeaders);
+    assert.equal(tokenBatch.status, 200, "Authenticated target may register a short-lived beacon token");
+    const helperReportBody = {
+      reportId: crypto.randomUUID(), beaconToken, observedAtMs: Date.now(),
+      latitude: 13.0827, longitude: 80.2707, accuracyMeters: 35, rssi: -68
+    };
+    const helperReport = await api("POST", "/android/device/location-helper/report", helperReportBody, tabletAuth);
+    assert.equal(helperReport.status, 200, "Authorized helper report with beacon proof should be accepted");
+    assert.equal(helperReport.data.source, "BLE_HELPER_PROXIMITY_ESTIMATE");
+    assert.equal(helperReport.data.accuracyMeters, null, "Helper accuracy must not be misrepresented as target accuracy");
+    const replayedHelperReport = await api("POST", "/android/device/location-helper/report", helperReportBody, tabletAuth);
+    assert.equal(replayedHelperReport.status, 409, "Replayed BLE beacon token must be rejected");
+    const deviceAfterHelperReport = await api("GET", "/api/devices", null, sessionHeaders);
+    assert.equal(deviceAfterHelperReport.status, 200);
+    assert.ok(deviceAfterHelperReport.data.items.find(item => item.deviceId === "existing-phone")
+      .locationResults.some(item => item.source === "BLE_HELPER_PROXIMITY_ESTIMATE"),
+      "Owner device response should expose the proximity estimate with an explicit source label");
+
     const rotate = await runAdmin("rotate-device", [
       ["Owner username:", "existing-owner"],
       ["Existing Device ID:", "jazz-tablet-01"]
