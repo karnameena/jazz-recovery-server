@@ -405,6 +405,78 @@ async function updateStateFromHeartbeat(device, input) {
       device.id);
 }
 
+async function resolveCellPosition(result) {
+  if (!Array.isArray(result?.cellTowers)) return result;
+  const towers = result.cellTowers.filter(t =>
+    t && ["gsm","wcdma","lte","nr","cdma"].includes(t.radioType) &&
+    Number.isInteger(t.mobileCountryCode) && t.mobileCountryCode >= 0 && t.mobileCountryCode <= 999 &&
+    Number.isInteger(t.mobileNetworkCode) && t.mobileNetworkCode >= 0 && t.mobileNetworkCode <= 999 &&
+    Number.isFinite(t.signalStrength) && t.signalStrength >= -160 && t.signalStrength <= 0 &&
+    (t.radioType === "nr"
+      ? Number.isSafeInteger(t.newRadioCellId) && t.newRadioCellId > 0
+      : Number.isSafeInteger(t.cellId) && t.cellId >= 0) &&
+    (t.radioType === "cdma" || Number.isInteger(t.locationAreaCode))
+  ).slice(0, 16);
+  delete result.cellTowers;
+  const locations = Array.isArray(result.locations) ? result.locations : [];
+  result.locations = locations;
+  if (!towers.length) {
+    locations.push({ source: "CELLULAR", status: "NO_VALID_CELL_MEASUREMENTS" });
+    return result;
+  }
+  const googleKey = String(process.env.JAZZ_GOOGLE_GEOLOCATION_API_KEY || "").trim();
+  const providers = [];
+  if (googleKey) providers.push({
+    source: "CELLULAR_GOOGLE",
+    url: "https://www.googleapis.com/geolocation/v1/geolocate?key=" + encodeURIComponent(googleKey),
+    body: { cellTowers: towers, considerIp: false }
+  });
+  providers.push({
+    source: "CELLULAR_BEACONDB",
+    url: "https://api.beacondb.net/v1/geolocate",
+    body: { cellTowers: towers, considerIp: false }
+  });
+  for (const provider of providers) {
+    try {
+      const response = await fetch(provider.url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "user-agent": "JazzRecovery/1.0 (cellular location; opt-in recovery)" },
+        body: JSON.stringify(provider.body),
+        signal: AbortSignal.timeout(6000)
+      });
+      if (!response.ok) {
+        locations.push({ source: provider.source, status: response.status === 404 ? "NO_MATCH" : "PROVIDER_ERROR" });
+        continue;
+      }
+      const body = await response.json();
+      const latitude = Number(body?.location?.lat);
+      const longitude = Number(body?.location?.lng);
+      const accuracy = Number(body?.accuracy);
+      if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
+          !Number.isFinite(longitude) || longitude < -180 || longitude > 180 ||
+          !Number.isFinite(accuracy) || accuracy < 0) {
+        locations.push({ source: provider.source, status: "INVALID_PROVIDER_RESULT" });
+        continue;
+      }
+      const cell = { source: provider.source, status: "SUCCESS", latitude, longitude,
+        accuracyMeters: accuracy, timestamp: Date.now(), fresh: true };
+      locations.push(cell);
+      // A provider result takes priority over cached location, but never overwrites
+      // an already successful fresh GPS/fused result selected by this command.
+      if (result.source === "LAST_KNOWN" || result.ok !== true) {
+        Object.assign(result, { ok: true, latitude, longitude, accuracyMeters: accuracy,
+          timestamp: cell.timestamp, source: provider.source, fresh: true });
+        delete result.error;
+      }
+      return result;
+    } catch {
+      locations.push({ source: provider.source, status: "PROVIDER_UNAVAILABLE" });
+    }
+  }
+  if (result.ok !== true) result.error = "CELLULAR_POSITIONING_UNAVAILABLE";
+  return result;
+}
+
 async function updateStateFromResult(device, command, result) {
   if (!result || typeof result !== "object") return;
   if (command.type === "device_status") {
@@ -1001,6 +1073,7 @@ const server = http.createServer(async (req, res) => {
       if (!device) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
       const body = await readJson(req, 8 * 1024 * 1024);
       const result = body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
+      if (result && (result.cellTowers || result.source === "CELLULAR")) await resolveCellPosition(result);
       const response = await db.transaction(async () => {
         await db.lockDevice(device.id);
       const command = await db.prepare("SELECT * FROM recovery_commands WHERE id=? AND device_id=?").get(resultMatch[1], device.id);
