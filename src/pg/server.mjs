@@ -1108,6 +1108,24 @@ const server = http.createServer(async (req, res) => {
       return json(req, res, 200, { ok: true, enabled });
     }
 
+    if (req.method === "POST" && path === "/android/device/location-helper/authorize") {
+      const target = await authenticateDevice(req);
+      if (!target) return json(req, res, 401, { ok: false, error: "Unauthorized target device" });
+      const body = await readJson(req, 4096);
+      const helperDeviceId = String(body.helperDeviceId || "").trim();
+      const enabled = body.enabled !== false;
+      const helper = await db.prepare("SELECT id FROM devices WHERE device_id=?").get(helperDeviceId);
+      if (!helper || helper.id === target.id) return json(req, res, 400, { ok: false, error: "A different registered helper device is required" });
+      if (enabled) {
+        const consent = await db.prepare("SELECT enabled FROM location_helper_consents WHERE helper_device_id=?").get(helper.id);
+        if (!consent?.enabled) return json(req, res, 409, { ok: false, error: "Helper owner must opt in before authorization" });
+      }
+      await db.prepare("INSERT INTO location_helper_authorizations(target_device_id,helper_device_id,owner_user_id,enabled,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(target_device_id,helper_device_id) DO UPDATE SET owner_user_id=EXCLUDED.owner_user_id,enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP")
+        .run(target.id, helper.id, target.user_id, enabled);
+      await audit(target.user_id, target.id, "LOCATION_HELPER_AUTHORIZATION", enabled ? "ENABLED" : "DISABLED");
+      return json(req, res, 200, { ok: true, helperDeviceId, enabled });
+    }
+
     if (req.method === "POST" && path === "/android/device/location-helper/beacon-setting") {
       const target = await authenticateDevice(req);
       if (!target) return json(req, res, 401, { ok: false, error: "Unauthorized device" });
