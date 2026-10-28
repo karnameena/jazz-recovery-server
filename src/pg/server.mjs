@@ -1160,6 +1160,8 @@ const server = http.createServer(async (req, res) => {
       }
       await db.transaction(async () => {
         await db.prepare("DELETE FROM location_helper_beacon_tokens WHERE target_device_id=? AND expires_at_ms<?").run(target.id, now);
+        const active = await db.prepare("SELECT COUNT(*) AS total FROM location_helper_beacon_tokens WHERE target_device_id=? AND expires_at_ms>=?").get(target.id, now);
+        if (Number(active?.total || 0) + tokens.length > 20) throw new HttpError(429, "Too many active location beacon tokens");
         for (const token of tokens) {
           const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
           await db.prepare("INSERT INTO location_helper_beacon_tokens(target_device_id,token_hash,expires_at_ms) VALUES(?,?,?) ON CONFLICT(target_device_id,token_hash) DO UPDATE SET expires_at_ms=EXCLUDED.expires_at_ms")
