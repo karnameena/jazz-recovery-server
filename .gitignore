@@ -1,4 +1,4 @@
-# SQLite recovery database contains private owner/device credentials and recovery records.
+﻿# SQLite recovery database contains private owner/device credentials and recovery records.
 # Never upload to GitHub. Use a persistent Render disk or another private data store.
 data/
 *.db
@@ -23,3 +23,18 @@ Thumbs.db
 # Local Neon CLI project/org/branch binding (may expose internal metadata)
 .neon
 .neon/
+
+# Jazz Recovery / Cloudflare local files
+.wrangler/
+.dev.vars
+trial.config.json
+local.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+*.pem
+*.p12
+*.key
+*service-account*.json
+*serviceAccount*.json

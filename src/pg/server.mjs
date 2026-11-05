@@ -1,13 +1,16 @@
 import http from "node:http";
 import crypto from "node:crypto";
+import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
+import { handleHelperLocationRoute } from "./helper-location.mjs";
+import { getBillingAccess, handleBillingRoute } from "./billing.mjs";
+import { TRIAL_DAYS, getTrialConfigForUsername } from "./subscription-config.mjs";
 import { applyMigrations, db } from "./database.mjs";
 import { hashSecret, verifySecret, validatePassword } from "../auth/password.mjs";
-import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 import { createSession, sessionCookie, clearSessionCookies, getSession, destroySession } from "./sessions.mjs";
 
 await applyMigrations();
 
-const port = Number(process.env.PORT || 8890);
+const port = Number(process.env.PORT || 8891);
 const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production" || String(process.env.RENDER || "").toLowerCase() === "true";
 const trustProxy = process.env.LOST_MODE_TRUST_PROXY == null
   ? isProduction
@@ -22,17 +25,26 @@ const DEVICE_AUTH_CACHE_TTL_MS = 5 * 60_000;
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const LOGIN_USER_LIMIT = 8;
 const LOGIN_IP_LIMIT = 30;
+const PIN_WINDOW_MS = 15 * 60_000;
+const PIN_USER_LIMIT = 5;
+const pinAttempts = new Map();
 const ALLOWED_COMMANDS = new Set(["DEVICE_STATUS", "GET_LOCATION", "RING_DEVICE", "RECOVERY_PHOTO", "SET_RECOVERY_MODE", "PLAY_VOICE_MESSAGE", "LOCATION_STATUS", "LOCATION_ENABLE", "LOCATION_DISABLE"]);
 const LOCATION_COMMANDS = new Set(["location_status", "location_enable", "location_disable"]);
 const LOCATION_WRITE_COMMANDS = new Set(["location_enable", "location_disable"]);
 const LOCATION_COMMAND_TTL_MS = 120_000;
 const DEDUPE_COMMANDS = new Set(["device_status", "device_location", "recovery_photo", "location_status", "location_enable", "location_disable"]);
 const loginAttempts = new Map();
-const recoveryAttempts = new Map();
-const dummyRecoveryPinHash = hashSecret("Jazz-Recovery-Dummy-PIN-Not-A-Valid-Recovery-PIN");
 const invalidDeviceAttempts = new Map();
 const deviceAuthCache = new Map();
 const dummyPasswordHash = hashSecret("Jazz-Lost-Mode-Dummy-Credential-Not-A-Login");
+
+function trialClaimHash(username) {
+  const normalized = String(username || "").trim().toLowerCase();
+  const pepper = String(process.env.JAZZ_TRIAL_CLAIM_PEPPER || "");
+  return pepper
+    ? crypto.createHmac("sha256", pepper).update(normalized).digest("hex")
+    : crypto.createHash("sha256").update(normalized).digest("hex");
+}
 
 function normalizeOrigin(value) {
   try {
@@ -51,6 +63,32 @@ const publicOrigins = new Set(
     .filter(Boolean)
 );
 const primaryPublicOrigin = [...publicOrigins][0] || "http://localhost:5190";
+
+// WebAuthn settings are derived from the existing public-origin configuration.
+// This keeps local development usable before a production domain is hosted and
+// avoids requiring separate RP_ID / RP_NAME / ORIGIN environment variables.
+function getWebAuthnConfig() {
+  const origins = [...publicOrigins];
+  const primary = new URL(primaryPublicOrigin);
+  const rpID = primary.hostname;
+  const rpName = "Jazz Recovery";
+  if (!rpID || !origins.length) {
+    throw new HttpError(503, "Passkeys are unavailable until a valid public origin is configured.");
+  }
+  if (isProduction && origins.some(origin => new URL(origin).protocol !== "https:")) {
+    throw new HttpError(503, "Passkeys require HTTPS in production. Configure the public website origin first.");
+  }
+  // All configured origins must belong to this RP ID. Multiple origins on
+  // unrelated hostnames cannot share one WebAuthn relying-party identity.
+  const invalidOrigin = origins.find(origin => {
+    const hostname = new URL(origin).hostname;
+    return hostname !== rpID && !hostname.endsWith(`.${rpID}`);
+  });
+  if (invalidOrigin) {
+    throw new HttpError(503, "Configured public origins must use the same WebAuthn relying-party domain.");
+  }
+  return { rpID, rpName, origins };
+}
 
 function requestIsHttps(req) {
   const forwarded = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
@@ -175,24 +213,6 @@ function clearLoginFailures(ip, username) {
   loginAttempts.delete(`ip:${ip}`);
 }
 
-function recoveryRateLimited(ip, username) {
-  const normalized = String(username || "").toLowerCase();
-  return attemptCount(recoveryAttempts, `user:${normalized}`, LOGIN_WINDOW_MS) >= 5 ||
-    attemptCount(recoveryAttempts, `ip:${ip}`, LOGIN_WINDOW_MS) >= 20;
-}
-
-function recordRecoveryFailure(ip, username) {
-  const normalized = String(username || "").toLowerCase();
-  recordAttempt(recoveryAttempts, `user:${normalized}`, LOGIN_WINDOW_MS);
-  recordAttempt(recoveryAttempts, `ip:${ip}`, LOGIN_WINDOW_MS);
-}
-
-function clearRecoveryFailures(ip, username) {
-  const normalized = String(username || "").toLowerCase();
-  recoveryAttempts.delete(`user:${normalized}`);
-  recoveryAttempts.delete(`ip:${ip}`);
-}
-
 async function audit(userId, deviceId, action, status) {
   await db.prepare("INSERT INTO recovery_audit(user_id,device_id,action,status) VALUES(?,?,?,?)")
     .run(userId ?? null, deviceId ?? null, action, status);
@@ -202,7 +222,7 @@ async function ownerDevice(userId, id) {
   return await db.prepare("SELECT * FROM devices WHERE id=? AND user_id=?").get(Number(id), userId);
 }
 
-function databaseUtcToIso(value) {
+function sqliteUtcToIso(value) {
   if (!value) return null;
   if (value instanceof Date) return value.toISOString();
   const raw = String(value).trim();
@@ -211,21 +231,21 @@ function databaseUtcToIso(value) {
   return Number.isNaN(parsed) ? raw : new Date(parsed).toISOString();
 }
 
-function databaseUtcToMs(value) {
-  const normalized = databaseUtcToIso(value);
+function sqliteUtcToMs(value) {
+  const normalized = sqliteUtcToIso(value);
   if (!normalized) return 0;
   const parsed = Date.parse(normalized);
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function databaseUtcTimestamp(ms) {
+function sqliteUtcTimestamp(ms) {
   return new Date(ms).toISOString();
 }
 
 async function stateFor(deviceDbId) {
   const row = await db.prepare("SELECT * FROM device_state WHERE device_id=?").get(deviceDbId);
   if (!row) return null;
-  const lastSeenMs = databaseUtcToMs(row.last_seen);
+  const lastSeenMs = sqliteUtcToMs(row.last_seen);
   return { ...row, online: Boolean(lastSeenMs && Date.now() - lastSeenMs <= ONLINE_WINDOW_MS) };
 }
 
@@ -239,14 +259,13 @@ async function publicDevice(row) {
     id: row.id,
     deviceId: row.device_id,
     deviceName: row.device_name,
-    imei: row.imei || null,
     deviceType: row.device_type,
     online: Boolean(state.online),
     mode: state.mode || "NORMAL_MODE",
     battery: state.battery,
     charging: Boolean(state.charging),
     network: state.network || "UNKNOWN",
-    lastSeen: databaseUtcToIso(state.last_seen),
+    lastSeen: sqliteUtcToIso(state.last_seen),
     locationServices: state.online ? locationServicesState(state.location_services_status) : "OFFLINE",
     locationServicesLastConfirmed: state.location_services_timestamp || null,
     location: state.latitude == null ? null : {
@@ -350,7 +369,7 @@ function sameCommandArgs(type, leftJson, rightArgs) {
 // Only Location Services commands expire; all existing recovery TTL behavior
 // stays untouched. A command must never execute after a lost phone reconnects late.
 async function expireLocationCommands(deviceDbId) {
-  const deadline = databaseUtcTimestamp(Date.now() - LOCATION_COMMAND_TTL_MS);
+  const deadline = sqliteUtcTimestamp(Date.now() - LOCATION_COMMAND_TTL_MS);
   const expired = await db.prepare(`SELECT id,type FROM recovery_commands WHERE device_id=? AND status='pending' AND type IN ('location_enable','location_disable','location_status') AND created_at<?`).all(deviceDbId, deadline);
   if (!expired.length) return;
   const update = db.prepare("UPDATE recovery_commands SET status='expired',completed_at=CURRENT_TIMESTAMP,leased_until=NULL WHERE id=? AND status='pending'");
@@ -462,6 +481,20 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (await handleHelperLocationRoute({ req, res, path, json, readJson, authenticateDevice, requireSession, ownerDevice, db, audit, sqliteUtcToIso })) return;
+    if (await handleBillingRoute({ req, res, path, json, readJson, requireSession, db })) return;
+
+    // Recovery data and commands are gated server-side; hiding the dashboard is not authorization.
+    if (path === "/api/devices" || path.startsWith("/api/devices/")) {
+      const billingSession = await requireSession(req, res);
+      if (!billingSession) return;
+      const access = await getBillingAccess(db, billingSession.user_id);
+      if (!access.allowed) return json(req, res, 402, {
+        ok: false, error: access.access === "trial_pending" ? "Your trial has not started yet." : "An active trial or verified subscription is required.",
+        access: access.access, trialStartsAt: access.trial?.starts_at || null, trialExpiresAt: access.trial?.expires_at || null
+      });
+    }
+
     if (req.method === "GET" && path === "/") {
       const nonce = crypto.randomBytes(18).toString("base64");
       return html(req, res, 200, serverHome(nonce), nonce);
@@ -474,7 +507,6 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req, 32 * 1024);
       const username = String(body.username || "").trim();
       const password = String(body.password || "");
-      const confirmPassword = String(body.confirmPassword || "");
       const deviceName = String(body.deviceName || "").trim();
       const imei = String(body.imei || "").replace(/[\s-]/g, "");
       const deviceId = String(body.deviceId || "").trim();
@@ -487,7 +519,6 @@ const server = http.createServer(async (req, res) => {
       }
       const passwordError = validatePassword(password);
       if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
-      if (password !== confirmPassword) return json(req, res, 400, { ok: false, error: "Passwords do not match." });
       if (!/^\d{4}$/.test(recoveryPin) || recoveryPin !== confirmRecoveryPin) {
         return json(req, res, 400, { ok: false, error: "Enter and confirm the same 4-digit recovery PIN." });
       }
@@ -506,26 +537,232 @@ const server = http.createServer(async (req, res) => {
           if (await db.prepare("SELECT id FROM devices WHERE device_id=?").get(deviceId)) {
             return { conflict: "This device token ID is already registered." };
           }
-          const user = await db.prepare("INSERT INTO users(username,password_hash,recovery_pin_hash) VALUES(?,?,?) RETURNING id")
+          const user = await db.prepare("INSERT INTO users(username,password_hash,recovery_pin_hash,recovery_pin_updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) RETURNING id")
             .get(username, hashSecret(password), hashSecret(recoveryPin));
           const device = await db.prepare("INSERT INTO devices(user_id,device_id,device_name,device_type,credential_hash,imei) VALUES(?,?,?,?,?,?) RETURNING id")
             .get(user.id, deviceId, deviceName, "Android", hashSecret(deviceToken), imei);
           await db.prepare("INSERT INTO device_state(device_id) VALUES(?)").run(device.id);
+          let trialActivated = false;
+          let trialStartsAt = null;
+          let trialEndsAt = null;
+          const userTrialConfig = getTrialConfigForUsername(username);
+          const trialEnabled = userTrialConfig ? userTrialConfig.enabled : TRIAL_DAYS > 0;
+          if (trialEnabled) {
+            const claim = await db.prepare("INSERT INTO billing_trial_claims(username_hash,user_id) VALUES(?,?) ON CONFLICT DO NOTHING RETURNING username_hash")
+              .get(trialClaimHash(username), user.id);
+            if (!claim) throw new HttpError(409, "This username has already claimed a trial. Contact support if the previous account was deleted by an administrator.");
+            {
+              const trial = userTrialConfig
+                ? await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,?,?) RETURNING starts_at,expires_at")
+                    .get(user.id, userTrialConfig.startsAt, userTrialConfig.endsAt)
+                : await db.prepare("INSERT INTO billing_trials(user_id,starts_at,expires_at) VALUES(?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + (? * INTERVAL '1 day')) RETURNING starts_at,expires_at")
+                    .get(user.id, TRIAL_DAYS);
+              const nowMs = Date.now();
+              trialActivated = new Date(trial.starts_at).getTime() <= nowMs &&
+                new Date(trial.expires_at).getTime() > nowMs;
+              trialStartsAt = trial.starts_at;
+              trialEndsAt = trial.expires_at;
+              await audit(user.id, null, "TRIAL_ACTIVATED", "SUCCESS");
+            }
+          }
           await audit(user.id, device.id, "DEVICE_REGISTER", "SUCCESS");
-          return { userId: user.id, deviceId: device.id };
+          return { userId: user.id, deviceId: device.id, trialActivated, trialStartsAt, trialEndsAt };
         });
         if (registered.conflict) return json(req, res, 409, { ok: false, error: registered.conflict });
-        const session = await createSession(registered.userId);
+        // Registration persists the account, paired device and trial window only.
+        // The user explicitly signs in afterwards; login then evaluates PostgreSQL trial access.
         return json(req, res, 201, {
           ok: true,
           username,
-          device: { id: registered.deviceId, deviceId, deviceName, imei, deviceType: "Android" },
-          expiresAt: session.expires
-        }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
+          trialActivated: registered.trialActivated,
+          trial: registered.trialActivated ? { startsAt: registered.trialStartsAt, expiresAt: registered.trialEndsAt } : null,
+          device: { id: registered.deviceId, deviceId, deviceName, imei, deviceType: "Android" }
+        });
       } catch (error) {
         if (error?.code === "23505") return json(req, res, 409, { ok: false, error: "Username or device is already registered." });
         throw error;
       }
+    }
+
+    // Restore an existing Android installation without creating a new device row.
+    // This mirrors the established Android repair contract and preserves device state/history.
+    if (req.method === "POST" && path === "/api/auth/device-repair") {
+      const body = await readJson(req, 32 * 1024);
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      const deviceId = String(body.deviceId || "").trim();
+      const deviceToken = String(body.deviceToken || "").trim();
+      const deviceName = String(body.deviceName || "").trim();
+      const imei = String(body.imei || "").replace(/[\s-]/g, "");
+      const ip = ipOf(req);
+
+      if (!username || username.length > 64 || !password || password.length > 512 ||
+          !/^[A-Za-z0-9._:-]{8,128}$/.test(deviceId) ||
+          deviceToken.length < 32 || deviceToken.length > 512 || !/^[A-Za-z0-9_-]+$/.test(deviceToken)) {
+        return json(req, res, 400, { ok: false, error: "Username, password, existing device ID and a new device token are required." });
+      }
+      if (deviceName.length > 80 || (imei && !/^\d{14,16}$/.test(imei))) {
+        return json(req, res, 400, { ok: false, error: "Device name or IMEI is invalid." });
+      }
+      if (loginRateLimited(ip, username)) {
+        return json(req, res, 429, { ok: false, error: "Too many attempts. Try again later." }, { "Retry-After": "900" });
+      }
+
+      const user = await db.prepare("SELECT * FROM users WHERE LOWER(username)=LOWER(?)").get(username);
+      const validPassword = verifySecret(password, user?.password_hash || dummyPasswordHash);
+      if (!user || !validPassword) {
+        recordLoginFailure(ip, username);
+        await audit(user?.id ?? null, null, "DEVICE_REPAIR", "FAILED_AUTH");
+        return json(req, res, 401, { ok: false, error: "Invalid username or password." });
+      }
+
+      const repaired = await db.transaction(async () => {
+        const device = await db.prepare("SELECT * FROM devices WHERE user_id=? AND device_id=? FOR UPDATE").get(user.id, deviceId);
+        if (!device) return null;
+        await db.prepare("UPDATE devices SET credential_hash=?,device_name=COALESCE(NULLIF(?,''),device_name),imei=COALESCE(NULLIF(?,''),imei),updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?")
+          .run(hashSecret(deviceToken), deviceName, imei, device.id, user.id);
+        await audit(user.id, device.id, "DEVICE_REPAIR", "SUCCESS");
+        return device.id;
+      });
+      if (!repaired) {
+        await audit(user.id, null, "DEVICE_REPAIR", "DEVICE_NOT_OWNED");
+        return json(req, res, 404, { ok: false, error: "That existing device ID is not registered to this account. Check the ID from your original pairing details." });
+      }
+
+      for (const key of deviceAuthCache.keys()) {
+        if (key.startsWith(String(repaired) + ":")) deviceAuthCache.delete(key);
+      }
+      clearLoginFailures(ip, username);
+      return json(req, res, 200, { ok: true, deviceId, message: "Existing device record re-paired. Its history and recovery state were preserved." });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/passkey/register/options") {
+      const session = await requireSession(req, res); if (!session) return;
+      const { rpID, rpName, origins } = getWebAuthnConfig();
+      const user = await db.prepare("SELECT id,username FROM users WHERE id=?").get(session.user_id);
+      const existing = await db.prepare("SELECT credential_id,transports FROM webauthn_credentials WHERE user_id=?").all(session.user_id);
+      const options = await generateRegistrationOptions({
+        rpName, rpID, userName: user.username, userID: new Uint8Array(Buffer.from(String(user.id))),
+        attestationType: "none", timeout: 60000, excludeCredentials: existing.map(c => ({ id: c.credential_id, transports: c.transports || [] })),
+        authenticatorSelection: { residentKey: "preferred", userVerification: "required" }
+      });
+      const flowId = crypto.randomUUID();
+      await db.prepare("INSERT INTO webauthn_challenges(flow_id,user_id,purpose,challenge,expires_at) VALUES(?,?, 'register', ?, CURRENT_TIMESTAMP + INTERVAL '5 minutes')")
+        .run(flowId, user.id, options.challenge);
+      return json(req, res, 200, { ok: true, flowId, options });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/passkey/register/verify") {
+      const session = await requireSession(req, res); if (!session) return;
+      const body = await readJson(req, 64 * 1024);
+      const flowId = String(body.flowId || "");
+      const challenge = await db.prepare("SELECT * FROM webauthn_challenges WHERE flow_id=? AND user_id=? AND purpose='register' AND consumed_at IS NULL AND expires_at>CURRENT_TIMESTAMP")
+        .get(flowId, session.user_id);
+      if (!challenge) return json(req, res, 400, { ok: false, error: "Passkey registration challenge expired or already used." });
+      const { rpID, origins } = getWebAuthnConfig();
+      const verification = await verifyRegistrationResponse({ response: body.response, expectedChallenge: challenge.challenge, expectedOrigin: origins, expectedRPID: rpID, requireUserVerification: true });
+      if (!verification.verified || !verification.registrationInfo) return json(req, res, 400, { ok: false, error: "Passkey verification failed." });
+      const info = verification.registrationInfo;
+      const credential = info.credential || { id: info.credentialID, publicKey: info.credentialPublicKey, counter: info.counter, transports: body.response?.response?.transports || [] };
+      await db.transaction(async () => {
+        const consumed = await db.prepare("UPDATE webauthn_challenges SET consumed_at=CURRENT_TIMESTAMP WHERE flow_id=? AND consumed_at IS NULL AND expires_at>CURRENT_TIMESTAMP RETURNING flow_id").get(flowId);
+        if (!consumed) throw new HttpError(409, "Passkey challenge was already consumed.");
+        await db.prepare(`INSERT INTO webauthn_credentials(credential_id,user_id,public_key,counter,transports,credential_device_type,backed_up)
+          VALUES(?,?,?, ?,?,?,?) ON CONFLICT(credential_id) DO NOTHING`)
+          .run(credential.id, session.user_id, Buffer.from(credential.publicKey), credential.counter || 0, credential.transports || [], info.credentialDeviceType || null, Boolean(info.credentialBackedUp));
+      });
+      await audit(session.user_id, null, "PASSKEY_REGISTER", "SUCCESS");
+      return json(req, res, 200, { ok: true, verified: true });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/password-reset/passkey/options") {
+      const body = await readJson(req, 16 * 1024);
+      const username = String(body.username || "").trim();
+      const user = await db.prepare("SELECT id FROM users WHERE LOWER(username)=LOWER(?)").get(username);
+      const credentials = user ? await db.prepare("SELECT credential_id,transports FROM webauthn_credentials WHERE user_id=?").all(user.id) : [];
+      if (!user || !credentials.length) return json(req, res, 200, { ok: true, available: false, message: "No registered passkey is available. Use your recovery PIN instead." });
+      const { rpID, origins } = getWebAuthnConfig();
+      if (!rpID || !origins.length) throw new HttpError(503, "Passkeys are not configured.");
+      const options = await generateAuthenticationOptions({ rpID, timeout: 60000, userVerification: "required", allowCredentials: credentials.map(c => ({ id: c.credential_id, transports: c.transports || [] })) });
+      const flowId = crypto.randomUUID();
+      await db.prepare("INSERT INTO webauthn_challenges(flow_id,user_id,username_key,purpose,challenge,expires_at) VALUES(?,?,LOWER(?),'password_reset',?,CURRENT_TIMESTAMP + INTERVAL '5 minutes')")
+        .run(flowId, user.id, username, options.challenge);
+      return json(req, res, 200, { ok: true, available: true, flowId, options });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/password-reset/passkey/verify") {
+      const body = await readJson(req, 64 * 1024);
+      const flowId = String(body.flowId || "");
+      const newPassword = String(body.newPassword || "");
+      const passwordError = validatePassword(newPassword);
+      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      const challenge = await db.prepare("SELECT * FROM webauthn_challenges WHERE flow_id=? AND purpose='password_reset' AND consumed_at IS NULL AND expires_at>CURRENT_TIMESTAMP").get(flowId);
+      if (!challenge) return json(req, res, 400, { ok: false, error: "Passkey challenge expired or already used." });
+      const credentialId = String(body.response?.id || "");
+      const credential = await db.prepare("SELECT * FROM webauthn_credentials WHERE credential_id=? AND user_id=?").get(credentialId, challenge.user_id);
+      if (!credential) return json(req, res, 401, { ok: false, error: "Passkey verification failed." });
+      const { rpID, origins } = getWebAuthnConfig();
+      const verification = await verifyAuthenticationResponse({ response: body.response, expectedChallenge: challenge.challenge, expectedOrigin: origins, expectedRPID: rpID, credential: { id: credential.credential_id, publicKey: new Uint8Array(credential.public_key), counter: Number(credential.counter), transports: credential.transports || [] }, requireUserVerification: true });
+      if (!verification.verified) return json(req, res, 401, { ok: false, error: "Passkey verification failed." });
+      await db.transaction(async () => {
+        const consumed = await db.prepare("UPDATE webauthn_challenges SET consumed_at=CURRENT_TIMESTAMP WHERE flow_id=? AND consumed_at IS NULL AND expires_at>CURRENT_TIMESTAMP RETURNING flow_id").get(flowId);
+        if (!consumed) throw new HttpError(409, "Passkey challenge was already consumed.");
+        await db.prepare("UPDATE webauthn_credentials SET counter=?,last_used_at=CURRENT_TIMESTAMP WHERE credential_id=?").run(verification.authenticationInfo.newCounter, credential.credential_id);
+        await db.prepare("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(hashSecret(newPassword), challenge.user_id);
+        await db.prepare("DELETE FROM sessions WHERE user_id=?").run(challenge.user_id);
+        await audit(challenge.user_id, null, "PASSWORD_RESET_PASSKEY", "SUCCESS");
+      });
+      return json(req, res, 200, { ok: true, message: "Password reset successful. All existing sessions have been signed out." }, { "Set-Cookie": clearSessionCookies() });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/recovery-pin") {
+      const session = await requireSession(req, res); if (!session) return;
+      const body = await readJson(req, 16 * 1024);
+      const currentPassword = String(body.currentPassword || "");
+      const recoveryPin = String(body.recoveryPin || "");
+      const confirmRecoveryPin = String(body.confirmRecoveryPin || "");
+      if (!currentPassword || currentPassword.length > 512) return json(req, res, 400, { ok: false, error: "Enter your current password." });
+      if (!/^\d{4}$/.test(recoveryPin) || recoveryPin !== confirmRecoveryPin) return json(req, res, 400, { ok: false, error: "Enter and confirm the same 4-digit recovery PIN." });
+      const user = await db.prepare("SELECT password_hash FROM users WHERE id=?").get(session.user_id);
+      if (!user || !verifySecret(currentPassword, user.password_hash)) return json(req, res, 401, { ok: false, error: "Current password is incorrect." });
+      await db.prepare("UPDATE users SET recovery_pin_hash=?, recovery_pin_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .run(hashSecret(recoveryPin), session.user_id);
+      await audit(session.user_id, null, "RECOVERY_PIN_UPDATED", "SUCCESS");
+      return json(req, res, 200, { ok: true, message: "Recovery PIN updated." });
+    }
+
+    if (req.method === "POST" && path === "/api/auth/forgot-password") {
+      const body = await readJson(req, 16 * 1024);
+      const username = String(body.username || "").trim();
+      const recoveryPin = String(body.recoveryPin || "");
+      const newPassword = String(body.newPassword || "");
+      const ip = ipOf(req);
+      const key = `${username.toLowerCase()}:${ip}`;
+      const persistedAttempts = await db.prepare("SELECT COUNT(*)::int AS count FROM auth_recovery_attempts WHERE username_key=? AND ip_key=? AND attempted_at > CURRENT_TIMESTAMP - INTERVAL '15 minutes' AND succeeded=FALSE").get(username.toLowerCase(), ip);
+      if (Number(persistedAttempts?.count || 0) >= PIN_USER_LIMIT || attemptCount(pinAttempts, key, PIN_WINDOW_MS) >= PIN_USER_LIMIT) return json(req, res, 429, { ok: false, error: "Too many recovery attempts. Try again in 15 minutes." }, { "Retry-After": "900" });
+      if (!/^[A-Za-z0-9._-]{3,64}$/.test(username) || !/^\d{4}$/.test(recoveryPin)) {
+        recordAttempt(pinAttempts, key, PIN_WINDOW_MS);
+        await db.prepare("INSERT INTO auth_recovery_attempts(username_key,ip_key,succeeded) VALUES(?,?,FALSE)").run(username.toLowerCase(), ip);
+        return json(req, res, 400, { ok: false, error: "Invalid username or recovery PIN." });
+      }
+      const passwordError = validatePassword(newPassword);
+      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
+      const user = await db.prepare("SELECT id,recovery_pin_hash FROM users WHERE LOWER(username)=LOWER(?)").get(username);
+      const validPin = verifySecret(recoveryPin, user?.recovery_pin_hash || dummyPasswordHash);
+      if (!user || !user.recovery_pin_hash || !validPin) {
+        recordAttempt(pinAttempts, key, PIN_WINDOW_MS);
+        await db.prepare("INSERT INTO auth_recovery_attempts(username_key,ip_key,succeeded) VALUES(?,?,FALSE)").run(username.toLowerCase(), ip);
+        await audit(user?.id ?? null, null, "PASSWORD_RESET_PIN", "FAILED");
+        return json(req, res, 401, { ok: false, error: "Invalid username or recovery PIN." });
+      }
+      await db.transaction(async () => {
+        await db.prepare("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(hashSecret(newPassword), user.id);
+        await db.prepare("DELETE FROM sessions WHERE user_id=?").run(user.id);
+        await audit(user.id, null, "PASSWORD_RESET_PIN", "SUCCESS");
+      });
+      pinAttempts.delete(key);
+      await db.prepare("INSERT INTO auth_recovery_attempts(username_key,ip_key,succeeded) VALUES(?,?,TRUE)").run(username.toLowerCase(), ip);
+      return json(req, res, 200, { ok: true, message: "Password reset successful. All existing sessions have been signed out." }, { "Set-Cookie": clearSessionCookies() });
     }
 
     if (req.method === "POST" && path === "/api/auth/login") {
@@ -541,7 +778,7 @@ const server = http.createServer(async (req, res) => {
         return json(req, res, 429, { ok: false, error: "Too many login attempts. Try again later." }, { "Retry-After": "900" });
       }
 
-      const user = await db.prepare("SELECT * FROM users WHERE LOWER(username)=LOWER(?)").get(username);
+      const user = await db.prepare("SELECT * FROM users WHERE username=? COLLATE NOCASE").get(username);
       const validPassword = verifySecret(password, user?.password_hash || dummyPasswordHash);
       if (!user || !validPassword) {
         recordLoginFailure(ip, username);
@@ -553,282 +790,6 @@ const server = http.createServer(async (req, res) => {
       const session = await createSession(user.id);
       await audit(user.id, null, "LOGIN", "SUCCESS");
       return json(req, res, 200, { ok: true, username: user.username, expiresAt: session.expires }, { "Set-Cookie": sessionCookie(session.token, session.expires) });
-    }
-
-    if (req.method === "POST" && path === "/api/auth/recovery-pin") {
-      const session = await requireSession(req, res);
-      if (!session) return;
-      const body = await readJson(req, 16 * 1024);
-      const password = String(body.password || "");
-      const recoveryPin = String(body.recoveryPin || "");
-      const confirmRecoveryPin = String(body.confirmRecoveryPin || "");
-      if (!/^\d{4}$/.test(recoveryPin) || recoveryPin !== confirmRecoveryPin) {
-        return json(req, res, 400, { ok: false, error: "Enter and confirm the same 4-digit recovery PIN." });
-      }
-      const user = await db.prepare("SELECT * FROM users WHERE id=?").get(session.user_id);
-      if (!user || !verifySecret(password, user.password_hash)) {
-        return json(req, res, 401, { ok: false, error: "Current password is incorrect." });
-      }
-      await db.transaction(async () => {
-        await db.prepare("UPDATE users SET recovery_pin_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-          .run(hashSecret(recoveryPin), session.user_id);
-        await audit(session.user_id, null, "RECOVERY_PIN_SET", "SUCCESS");
-      });
-      return json(req, res, 200, { ok: true, message: "Recovery PIN saved securely." });
-    }
-
-    if (req.method === "POST" && path === "/api/auth/forgot-password") {
-      const body = await readJson(req, 16 * 1024);
-      const username = String(body.username || "").trim();
-      const recoveryPin = String(body.recoveryPin || "");
-      const newPassword = String(body.newPassword || "");
-      const ip = ipOf(req);
-      if (!username || username.length > 64 || !/^\d{4}$/.test(recoveryPin)) {
-        return json(req, res, 400, { ok: false, error: "Unable to verify recovery details. Check the username and 4-digit PIN." });
-      }
-      if (recoveryRateLimited(ip, username)) {
-        return json(req, res, 429, { ok: false, error: "Too many recovery attempts. Try again later." }, { "Retry-After": "900" });
-      }
-      const passwordError = validatePassword(newPassword);
-      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
-      const user = await db.prepare("SELECT id,username,recovery_pin_hash FROM users WHERE LOWER(username)=LOWER(?)").get(username);
-      const validPin = verifySecret(recoveryPin, user?.recovery_pin_hash || dummyRecoveryPinHash);
-      if (!user || !user.recovery_pin_hash || !validPin) {
-        recordRecoveryFailure(ip, username);
-        await audit(user?.id ?? null, null, "PASSWORD_RESET", "FAILED");
-        return json(req, res, 400, { ok: false, error: "Unable to verify recovery details. Check the username and 4-digit PIN, or use another recovery method." });
-      }
-      await db.transaction(async () => {
-        await db.prepare("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(hashSecret(newPassword), user.id);
-        await db.prepare("DELETE FROM sessions WHERE user_id=?").run(user.id);
-        await audit(user.id, null, "PASSWORD_RESET", "SUCCESS");
-      });
-      clearRecoveryFailures(ip, username);
-      return json(req, res, 200, { ok: true, message: "Password reset successful. Sign in with your new password." }, { "Set-Cookie": clearSessionCookies() });
-    }
-
-    if (req.method === "POST" && path === "/api/auth/device-repair") {
-      const body = await readJson(req, 32 * 1024);
-      const username = String(body.username || "").trim();
-      const password = String(body.password || "");
-      const deviceId = String(body.deviceId || "").trim();
-      const deviceToken = String(body.deviceToken || "").trim();
-      const deviceName = String(body.deviceName || "").trim();
-      const imei = String(body.imei || "").replace(/[\s-]/g, "");
-      const ip = ipOf(req);
-
-      if (!username || username.length > 64 || !password || password.length > 512 ||
-          !deviceId || deviceId.length > 128 || deviceToken.length < 32 ||
-          deviceToken.length > 512 || !/^[A-Za-z0-9_-]+$/.test(deviceToken)) {
-        return json(req, res, 400, { ok: false, error: "Username, password, existing device ID and a new device token are required." });
-      }
-      if (loginRateLimited(ip, username)) {
-        return json(req, res, 429, { ok: false, error: "Too many attempts. Try again later." }, { "Retry-After": "900" });
-      }
-
-      const user = await db.prepare("SELECT * FROM users WHERE LOWER(username)=LOWER(?)").get(username);
-      const validPassword = verifySecret(password, user?.password_hash || dummyPasswordHash);
-      if (!user || !validPassword) {
-        recordLoginFailure(ip, username);
-        await audit(user?.id ?? null, null, "DEVICE_REPAIR", "FAILED_AUTH");
-        return json(req, res, 401, { ok: false, error: "Invalid username or password." });
-      }
-
-      const device = await db.prepare("SELECT * FROM devices WHERE user_id=? AND device_id=?").get(user.id, deviceId);
-      if (!device) {
-        await audit(user.id, null, "DEVICE_REPAIR", "DEVICE_NOT_OWNED");
-        return json(req, res, 404, { ok: false, error: "That existing device ID is not registered to this account." });
-      }
-
-      const cleanName = deviceName.slice(0, 80);
-      const cleanImei = /^\d{14,20}$/.test(imei) ? imei : "";
-      await db.prepare("UPDATE devices SET credential_hash=?,device_name=COALESCE(NULLIF(?,''),device_name),imei=COALESCE(NULLIF(?,''),imei),updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?")
-        .run(hashSecret(deviceToken), cleanName, cleanImei, device.id, user.id);
-      for (const key of deviceAuthCache.keys()) {
-        if (key.startsWith(String(device.id) + ":")) deviceAuthCache.delete(key);
-      }
-      clearLoginFailures(ip, username);
-      await audit(user.id, device.id, "DEVICE_REPAIR", "SUCCESS");
-      return json(req, res, 200, { ok: true, deviceId, message: "Existing device record re-paired. Its history and recovery state were preserved." });
-    }
-
-    if (req.method === "POST" && path === "/api/auth/passkey/register/options") {
-      const session = await requireSession(req, res);
-      if (!session) return;
-      const user = await db.prepare("SELECT id,username FROM users WHERE id=?").get(session.user_id);
-      if (!user) return json(req, res, 401, { ok: false, error: "Authentication required" });
-
-      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
-      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
-      const existing = await db.prepare("SELECT credential_id,transports_json FROM passkey_credentials WHERE user_id=?").all(user.id);
-      const options = await generateRegistrationOptions({
-        rpName: "Jazz Recovery",
-        rpID,
-        userID: new Uint8Array(Buffer.from(String(user.id), "utf8")),
-        userName: user.username,
-        userDisplayName: user.username,
-        attestationType: "none",
-        excludeCredentials: existing.map(item => ({
-          id: item.credential_id,
-          transports: JSON.parse(item.transports_json || "[]")
-        })),
-        authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
-        timeout: 60000
-      });
-
-      await db.prepare("DELETE FROM passkey_challenges WHERE expires_at <= CURRENT_TIMESTAMP").run();
-      const flowId = crypto.randomUUID();
-      await db.prepare("INSERT INTO passkey_challenges(id,user_id,challenge,kind,expires_at) VALUES(?,?,?,'register',?)")
-        .run(flowId, user.id, options.challenge, new Date(Date.now() + 5 * 60_000).toISOString());
-      return json(req, res, 200, { ok: true, flowId, options });
-    }
-
-    if (req.method === "POST" && path === "/api/auth/passkey/register/verify") {
-      const session = await requireSession(req, res);
-      if (!session) return;
-      const body = await readJson(req, 128 * 1024);
-      const flowId = String(body.flowId || "");
-      const challengeRow = await db.prepare("SELECT * FROM passkey_challenges WHERE id=? AND user_id=? AND kind='register' AND expires_at>CURRENT_TIMESTAMP")
-        .get(flowId, session.user_id);
-      if (!challengeRow) {
-        await db.prepare("DELETE FROM passkey_challenges WHERE id=? AND user_id=? AND kind='register'").run(flowId, session.user_id);
-        return json(req, res, 400, { ok: false, error: "Passkey setup expired. Please try again." });
-      }
-
-      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
-      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
-      const verification = await verifyRegistrationResponse({
-        response: body.response,
-        expectedChallenge: challengeRow.challenge,
-        expectedOrigin: rpOrigin,
-        expectedRPID: rpID,
-        requireUserVerification: true
-      });
-      if (!verification.verified || !verification.registrationInfo) {
-        await db.prepare("DELETE FROM passkey_challenges WHERE id=? AND user_id=? AND kind='register'").run(flowId, session.user_id);
-        await audit(session.user_id, null, "PASSKEY_REGISTER", "FAILED");
-        return json(req, res, 400, { ok: false, error: "Passkey verification failed." });
-      }
-
-      const credential = verification.registrationInfo.credential;
-      const saved = await db.transaction(async () => {
-        const consumed = await db.prepare("DELETE FROM passkey_challenges WHERE id=? AND user_id=? AND kind='register' AND expires_at>CURRENT_TIMESTAMP")
-          .run(flowId, session.user_id);
-        if (consumed.changes !== 1) return false;
-        const inserted = await db.prepare("INSERT INTO passkey_credentials(credential_id,user_id,public_key,counter,transports_json) VALUES(?,?,?,?,?) ON CONFLICT (credential_id) DO NOTHING")
-          .run(credential.id, session.user_id, Buffer.from(credential.publicKey).toString("base64url"),
-            Number(credential.counter || 0),
-            JSON.stringify(credential.transports || body.response?.response?.transports || []));
-        if (inserted.changes !== 1) return false;
-        await audit(session.user_id, null, "PASSKEY_REGISTER", "SUCCESS");
-        return true;
-      });
-      if (!saved) return json(req, res, 409, { ok: false, error: "This passkey was already registered or the setup request expired. Start again." });
-      return json(req, res, 200, { ok: true });
-    }
-
-    if (req.method === "POST" && (path === "/api/auth/password-reset/passkey/options" || path === "/api/auth/passkey/options")) {
-      const body = await readJson(req, 16 * 1024);
-      const username = String(body.username || "").trim();
-      const ip = ipOf(req);
-      if (recoveryRateLimited(ip, username)) {
-        return json(req, res, 429, { ok: false, error: "Too many recovery attempts. Try again later." }, { "Retry-After": "900" });
-      }
-
-      const user = username && username.length <= 64
-        ? await db.prepare("SELECT id,username FROM users WHERE LOWER(username)=LOWER(?)").get(username)
-        : null;
-      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
-      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
-      const credentials = user
-        ? await db.prepare("SELECT credential_id,transports_json FROM passkey_credentials WHERE user_id=?").all(user.id)
-        : [];
-      if (!credentials.length) {
-        return json(req, res, 200, {
-          ok: true,
-          available: false,
-          message: "No registered passkey is available for this account. Use your recovery PIN or sign in to register a passkey."
-        });
-      }
-
-      const options = await generateAuthenticationOptions({
-        rpID,
-        allowCredentials: credentials.map(item => ({
-          id: item.credential_id,
-          transports: JSON.parse(item.transports_json || "[]")
-        })),
-        userVerification: "required",
-        timeout: 60000
-      });
-      await db.prepare("DELETE FROM passkey_challenges WHERE expires_at <= CURRENT_TIMESTAMP").run();
-      const flowId = crypto.randomUUID();
-      await db.prepare("INSERT INTO passkey_challenges(id,user_id,challenge,kind,expires_at) VALUES(?,?,?,'reset',?)")
-        .run(flowId, user.id, options.challenge, new Date(Date.now() + 5 * 60_000).toISOString());
-      return json(req, res, 200, { ok: true, available: true, flowId, options });
-    }
-
-    if (req.method === "POST" && (path === "/api/auth/password-reset/passkey/verify" || path === "/api/auth/passkey/verify")) {
-      const body = await readJson(req, 128 * 1024);
-      const flowId = String(body.flowId || "");
-      const newPassword = String(body.newPassword || "");
-      const passwordError = validatePassword(newPassword);
-      const ip = ipOf(req);
-      if (passwordError) return json(req, res, 400, { ok: false, error: passwordError });
-
-      const challengeRow = await db.prepare("SELECT * FROM passkey_challenges WHERE id=? AND kind='reset' AND expires_at>CURRENT_TIMESTAMP")
-        .get(flowId);
-      if (!challengeRow) {
-        await db.prepare("DELETE FROM passkey_challenges WHERE id=? AND kind='reset'").run(flowId);
-        return json(req, res, 400, { ok: false, error: "Passkey reset expired. Start again." });
-      }
-
-      const credentialId = String(body.response?.id || "");
-      const credential = await db.prepare("SELECT * FROM passkey_credentials WHERE credential_id=? AND user_id=?")
-        .get(credentialId, challengeRow.user_id);
-      if (!credential) {
-        await db.prepare("DELETE FROM passkey_challenges WHERE id=? AND kind='reset'").run(flowId);
-        recordRecoveryFailure(ip, String(challengeRow.user_id));
-        await audit(challengeRow.user_id, null, "PASSWORD_RESET_PASSKEY", "FAILED_CREDENTIAL");
-        return json(req, res, 401, { ok: false, error: "Passkey could not be verified." });
-      }
-
-      const rpOrigin = process.env.JAZZ_WEBAUTHN_ORIGIN || primaryPublicOrigin;
-      const rpID = process.env.JAZZ_WEBAUTHN_RP_ID || new URL(rpOrigin).hostname;
-      const verification = await verifyAuthenticationResponse({
-        response: body.response,
-        expectedChallenge: challengeRow.challenge,
-        expectedOrigin: rpOrigin,
-        expectedRPID: rpID,
-        credential: {
-          id: credential.credential_id,
-          publicKey: new Uint8Array(Buffer.from(credential.public_key, "base64url")),
-          counter: Number(credential.counter || 0),
-          transports: JSON.parse(credential.transports_json || "[]")
-        },
-        requireUserVerification: true
-      });
-      if (!verification.verified) {
-        await db.prepare("DELETE FROM passkey_challenges WHERE id=? AND kind='reset'").run(flowId);
-        recordRecoveryFailure(ip, String(challengeRow.user_id));
-        await audit(challengeRow.user_id, null, "PASSWORD_RESET_PASSKEY", "FAILED_VERIFICATION");
-        return json(req, res, 401, { ok: false, error: "Passkey could not be verified." });
-      }
-
-      const saved = await db.transaction(async () => {
-        const consumed = await db.prepare("DELETE FROM passkey_challenges WHERE id=? AND user_id=? AND kind='reset' AND expires_at>CURRENT_TIMESTAMP")
-          .run(flowId, challengeRow.user_id);
-        if (consumed.changes !== 1) return false;
-        await db.prepare("UPDATE passkey_credentials SET counter=?,last_used_at=CURRENT_TIMESTAMP WHERE credential_id=? AND user_id=?")
-          .run(Number(verification.authenticationInfo.newCounter || 0), credential.credential_id, challengeRow.user_id);
-        await db.prepare("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-          .run(hashSecret(newPassword), challengeRow.user_id);
-        await db.prepare("DELETE FROM sessions WHERE user_id=?").run(challengeRow.user_id);
-        await audit(challengeRow.user_id, null, "PASSWORD_RESET_PASSKEY", "SUCCESS");
-        return true;
-      });
-      if (!saved) return json(req, res, 400, { ok: false, error: "Passkey reset expired or was already used. Start again." });
-      clearRecoveryFailures(ip, String(challengeRow.user_id));
-      return json(req, res, 200, { ok: true, message: "Password reset successful. Sign in with your new password." }, { "Set-Cookie": clearSessionCookies() });
     }
 
     if (req.method === "POST" && path === "/api/auth/logout") {
@@ -856,6 +817,16 @@ const server = http.createServer(async (req, res) => {
       const row = await ownerDevice(session.user_id, deviceMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       return json(req, res, 200, { ok: true, device: await publicDevice(row) });
+    }
+
+    // IMEI is deliberately excluded from normal device/list responses. Reveal it
+    // only after an explicit request, and only for a device owned by this session.
+    const imeiMatch = path.match(/^\/api\/devices\/(\d+)\/imei$/);
+    if (req.method === "GET" && imeiMatch) {
+      const session = await requireSession(req, res); if (!session) return;
+      const row = await ownerDevice(session.user_id, imeiMatch[1]);
+      if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
+      return json(req, res, 200, { ok: true, imei: row.imei || null });
     }
 
     const actionMatch = path.match(/^\/api\/devices\/(\d+)\/actions$/);
@@ -924,8 +895,8 @@ const server = http.createServer(async (req, res) => {
         state?.online ? "PENDING" : "DEVICE_OFFLINE";
       return json(req, res, 200, { ok: true, commandId: command.id, status,
         confirmed, command: command.type, result: outcome,
-        createdAt: databaseUtcToIso(command.created_at),
-        completedAt: databaseUtcToIso(command.completed_at) });
+        createdAt: sqliteUtcToIso(command.created_at),
+        completedAt: sqliteUtcToIso(command.completed_at) });
     }
 
     const auditMatch = path.match(/^\/api\/devices\/(\d+)\/audit$/);
@@ -934,7 +905,7 @@ const server = http.createServer(async (req, res) => {
       const row = await ownerDevice(session.user_id, auditMatch[1]);
       if (!row) return json(req, res, 404, { ok: false, error: "Device not found" });
       const items = (await db.prepare("SELECT action,status,created_at FROM recovery_audit WHERE user_id=? AND device_id=? ORDER BY id DESC LIMIT 50").all(session.user_id, row.id))
-        .map(item => ({ ...item, created_at: databaseUtcToIso(item.created_at) }));
+        .map(item => ({ ...item, created_at: sqliteUtcToIso(item.created_at) }));
       return json(req, res, 200, { ok: true, items });
     }
 
@@ -955,15 +926,15 @@ const server = http.createServer(async (req, res) => {
         await expireLocationCommands(device.id);
         const next = await db.prepare(`SELECT * FROM recovery_commands WHERE device_id=? AND status='pending' AND (leased_until IS NULL OR leased_until<CURRENT_TIMESTAMP) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`).get(device.id);
         if (!next) return null;
-        const leasedUntil = databaseUtcTimestamp(Date.now() + 30_000);
+        const leasedUntil = sqliteUtcTimestamp(Date.now() + 30_000);
         await db.prepare("UPDATE recovery_commands SET leased_until=? WHERE id=?").run(leasedUntil, next.id);
         return next;
       });
       if (!command) return json(req, res, 200, { ok: true, command: null });
-      const createdAtMs = databaseUtcToMs(command.created_at);
+      const createdAtMs = sqliteUtcToMs(command.created_at);
       return json(req, res, 200, { ok: true, command: {
         id: command.id, type: command.type, args: JSON.parse(command.args_json || "{}"),
-        createdAt: databaseUtcToIso(command.created_at),
+        createdAt: sqliteUtcToIso(command.created_at),
         ...(LOCATION_COMMANDS.has(command.type)
           ? { createdAtMs, expiresAtMs: createdAtMs + LOCATION_COMMAND_TTL_MS }
           : {})

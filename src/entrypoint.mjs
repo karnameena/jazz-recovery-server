@@ -1,18 +1,9 @@
-// Jazz Recovery has one supported runtime database: PostgreSQL.
-// Fail closed when configuration is missing or asks for a legacy engine.
-// Never silently start against a local SQLite file.
-const engine = String(process.env.JAZZ_DB_ENGINE || "postgres").trim().toLowerCase();
-
+// Jazz Recovery production runtime is PostgreSQL-only. Missing configuration fails closed.
+const engine = String(process.env.JAZZ_DB_ENGINE || "").trim().toLowerCase();
 if (engine !== "postgres") {
-  throw new Error(
-    "Unsupported JAZZ_DB_ENGINE. Jazz Recovery requires PostgreSQL; set JAZZ_DB_ENGINE=postgres."
-  );
+  throw new Error("Jazz Recovery requires JAZZ_DB_ENGINE=postgres. SQLite fallback is disabled.");
 }
-
 if (!String(process.env.DATABASE_URL || "").trim()) {
-  throw new Error(
-    "DATABASE_URL is required. Configure the Neon PostgreSQL connection in the private server environment."
-  );
+  throw new Error("DATABASE_URL is required for JAZZ_DB_ENGINE=postgres.");
 }
-
 await import("./pg/server.mjs");

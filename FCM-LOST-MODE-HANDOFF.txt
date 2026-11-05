@@ -1,0 +1,16 @@
+﻿JAZZ RECOVERY - SERVER - FCM LOST MODE HANDOFF
+
+Previous work:
+Existing Jazz Recovery project source and recovery workflows.
+
+Current update:
+Source copied from the November 2026 project archive.
+FCM and Lost Mode integration is included for review.
+Existing README and project documentation are retained.
+Build caches, generated output, local secrets and signing files are excluded.
+
+Important:
+Preserve existing Android camera, location and recovery workflows.
+Verify FCM registration, Worker delivery, D1 persistence and device response.
+Do not deploy or apply database migrations without separate verification.
+This is a source handoff, not production deployment approval.

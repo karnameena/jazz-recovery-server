@@ -1,0 +1,21 @@
+name = "jazz-recovery-api-staging"
+account_id = "1c4abdf4e5af8f74227f66c0180150a8"
+main = "src/index.js"
+compatibility_date = "2026-10-30"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+WEB_ORIGINS = "https://jazz-recovery-staging.pages.dev"
+TRIAL_DAYS = "14"
+APP_TIME_ZONE_OFFSET_MINUTES = "330"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "jazz-recovery-main"
+database_id = "d74d8661-0c9d-4fde-8c19-a5e56aafb51e"
+remote = false
+migrations_dir = "../migrations/cloudflare"
+
+[triggers]
+crons = ["*/5 * * * *"]

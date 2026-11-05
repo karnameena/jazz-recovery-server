@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { spawn, spawnSync } from "node:child_process";
 import pg from "pg";
 import { hashSecret } from "../src/auth/password.mjs";
@@ -48,48 +51,58 @@ async function runAdmin(command, prompts) {
   });
 }
 
-test("PostgreSQL-backed recovery workflows preserve owner and device credentials", { skip: !local, timeout: 120_000 }, async t => {
-  const reset = new pg.Pool({ connectionString: testUrl, ssl: false });
-  await reset.query("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;");
-  await reset.end();
+test("private SQLite import preserves owner/device hashes and recovery API on PostgreSQL", { skip: !local, timeout: 120_000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jazz-pg-integration-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sqliteFile = path.join(dir, "fixture.db");
+  const sqlite = new DatabaseSync(sqliteFile);
+  try {
+    sqlite.exec(fs.readFileSync(path.join(projectRoot, "migrations/001_initial.sql"), "utf8"));
+    sqlite.exec(fs.readFileSync(path.join(projectRoot, "migrations/002_location_service_readback.sql"), "utf8"));
+    const owner = sqlite.prepare("INSERT INTO users(username,password_hash) VALUES(?,?)")
+      .run("existing-owner", hashSecret("ExistingPassword123!"));
+    const token = "fixture-" + crypto.randomBytes(24).toString("hex");
+    const device = sqlite.prepare("INSERT INTO devices(user_id,device_id,device_name,credential_hash) VALUES(?,?,?,?)")
+      .run(Number(owner.lastInsertRowid), "existing-phone", "Original Mobile", hashSecret(token));
+    const dbId = Number(device.lastInsertRowid);
+    sqlite.prepare("INSERT INTO device_state(device_id,photo_data_url,location_services_status) VALUES(?,?,?)")
+      .run(dbId, "data:image/jpeg;base64,YWJj", "ON");
+    const pending = crypto.randomUUID();
+    sqlite.prepare("INSERT INTO recovery_commands(id,device_id,type) VALUES(?,?,?)")
+      .run(pending, dbId, "ring_device");
+    sqlite.close();
 
-  const migration = spawnSync(process.execPath, ["src/pg/migrate.mjs"], {
-    cwd: projectRoot,
-    env: { ...envTest, JAZZ_DB_ENGINE: "postgres" },
-    encoding: "utf8",
-    timeout: 30_000
-  });
-  assert.equal(migration.status, 0, "PostgreSQL migrations failed: " + migration.stderr);
+    const dryEnv = { ...envTest, JAZZ_SQLITE_SOURCE: sqliteFile };
+    delete dryEnv.DATABASE_URL;
+    const dry = spawnSync(process.execPath, ["src/scripts/import-sqlite-to-postgres.mjs"], { cwd: projectRoot, env: dryEnv, encoding: "utf8" });
+    assert.equal(dry.status, 0, "SQLite dry-run failed: " + dry.stderr);
+    assert.match(dry.stdout, /DRY RUN ONLY/);
 
-  const pool = new pg.Pool({ connectionString: testUrl, ssl: false });
-  t.after(async () => await pool.end());
-  const ownerResult = await pool.query(
-    "INSERT INTO users(username,password_hash,recovery_pin_hash) VALUES($1,$2,$3) RETURNING id",
-    ["existing-owner", hashSecret("ExistingPassword123!"), hashSecret("2580")]
-  );
-  const ownerId = Number(ownerResult.rows[0].id);
-  const token = "fixture-" + crypto.randomBytes(24).toString("hex");
-  const deviceResult = await pool.query(
-    "INSERT INTO devices(user_id,device_id,device_name,credential_hash) VALUES($1,$2,$3,$4) RETURNING id",
-    [ownerId, "existing-phone", "Original Mobile", hashSecret(token)]
-  );
-  const deviceDbId = Number(deviceResult.rows[0].id);
-  await pool.query(
-    "INSERT INTO device_state(device_id,photo_data_url,location_services_status) VALUES($1,$2,$3)",
-    [deviceDbId, "data:image/jpeg;base64,YWJj", "ON"]
-  );
-  const retained = await pool.query(
-    "SELECT u.username,d.device_id,d.device_name,u.password_hash,u.recovery_pin_hash,s.photo_data_url " +
-    "FROM users u JOIN devices d ON d.user_id=u.id JOIN device_state s ON s.device_id=d.id WHERE u.id=$1",
-    [ownerId]
-  );
-  assert.equal(retained.rows.length, 1);
-  assert.equal(retained.rows[0].username, "existing-owner");
-  assert.equal(retained.rows[0].device_id, "existing-phone");
-  assert.equal(retained.rows[0].device_name, "Original Mobile");
-  assert.ok(retained.rows[0].password_hash.startsWith("scrypt$"));
-  assert.ok(retained.rows[0].recovery_pin_hash.startsWith("scrypt$"));
-  assert.equal(retained.rows[0].photo_data_url, "data:image/jpeg;base64,YWJj");
+    const pool = new pg.Pool({ connectionString: testUrl, ssl: false });
+    t.after(async () => await pool.end());
+    // Strictly local isolated CI database. Never truncate a remotely hosted DB.
+    await pool.query("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;");
+    const applyEnv = { ...envTest, JAZZ_SQLITE_SOURCE: sqliteFile, JAZZ_CONFIRM_MIGRATION: "YES" };
+    const importRun = spawnSync(process.execPath, ["src/scripts/import-sqlite-to-postgres.mjs", "--apply"],
+      { cwd: projectRoot, env: applyEnv, encoding: "utf8", timeout: 60_000 });
+    assert.equal(importRun.status, 0, "Private import failed: " + importRun.stderr + " " + importRun.stdout);
+    assert.match(importRun.stdout, /Import committed and validated/);
+
+    const rows = await pool.query("SELECT u.username,d.device_id,d.device_name,d.credential_hash,u.password_hash FROM users u JOIN devices d ON d.user_id=u.id");
+    assert.equal(rows.rows.length, 1);
+    assert.equal(rows.rows[0].username, "existing-owner");
+    assert.equal(rows.rows[0].device_id, "existing-phone");
+    assert.equal(rows.rows[0].device_name, "Original Mobile");
+    assert.ok(rows.rows[0].credential_hash.startsWith("scrypt$"));
+    assert.ok(rows.rows[0].password_hash.startsWith("scrypt$"));
+    const expired = await pool.query("SELECT status FROM recovery_commands WHERE id=$1", [pending]);
+    assert.equal(expired.rows[0].status, "expired");
+    const oldPhoto = await pool.query("SELECT photo_data_url FROM device_state");
+    assert.equal(oldPhoto.rows[0].photo_data_url, "data:image/jpeg;base64,YWJj");
+
+    const second = spawnSync(process.execPath, ["src/scripts/import-sqlite-to-postgres.mjs", "--apply"],
+      { cwd: projectRoot, env: applyEnv, encoding: "utf8", timeout: 60_000 });
+    assert.notEqual(second.status, 0, "Import must never overwrite populated Postgres");
 
     const port = await openPort();
     const base = "http://127.0.0.1:" + port;
@@ -137,6 +150,28 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     }, deviceHeaders);
     assert.equal(hb.status, 200, "Original device token should still authenticate");
 
+    // Android's existing re-pair screen must rotate only the credential on the
+    // owned device row; device identity, state, photo and command history remain.
+    const repairedToken = "repair-" + crypto.randomBytes(24).toString("hex");
+    const repair = await api("POST", "/api/auth/device-repair", {
+      username: "existing-owner", password: "ExistingPassword123!",
+      deviceId: "existing-phone", deviceToken: repairedToken, deviceName: "Restored Mobile"
+    });
+    assert.equal(repair.status, 200, "Existing Android re-pair endpoint must accept the established payload");
+    assert.equal(repair.data.deviceId, "existing-phone");
+    const oldTokenHeartbeat = await api("POST", "/android/device/heartbeat", {
+      deviceId: "existing-phone", mode: "NORMAL_MODE", status: { online: true }
+    }, deviceHeaders);
+    assert.equal(oldTokenHeartbeat.status, 401, "Rotated token must invalidate the previous credential");
+    const repairedHeaders = {Authorization:"Bearer " + repairedToken, "X-Jazz-Lost-Device-Id":"existing-phone"};
+    const repairedHeartbeat = await api("POST", "/android/device/heartbeat", {
+      deviceId: "existing-phone", mode: "NORMAL_MODE", status: { online: true }
+    }, repairedHeaders);
+    assert.equal(repairedHeartbeat.status, 200, "New Android token must authenticate after re-pair");
+    const preserved = await pool.query("SELECT d.device_name,s.photo_data_url FROM devices d JOIN device_state s ON s.device_id=d.id WHERE d.id=$1", [id]);
+    assert.equal(preserved.rows[0].device_name, "Restored Mobile");
+    assert.equal(preserved.rows[0].photo_data_url, "data:image/jpeg;base64,YWJj", "Re-pair must preserve recovery photo/history");
+
     const actions = "/api/devices/" + id + "/actions";
     const [q1,q2] = await Promise.all([
       api("POST",actions,{action:"LOCATION_ENABLE"},sessionHeaders),
@@ -149,8 +184,8 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     assert.equal(conflict.status, 409);
 
     const [next1,next2] = await Promise.all([
-      api("GET","/android/device/commands/next",null,deviceHeaders),
-      api("GET","/android/device/commands/next",null,deviceHeaders)
+      api("GET","/android/device/commands/next",null,repairedHeaders),
+      api("GET","/android/device/commands/next",null,repairedHeaders)
     ]);
     const received = [next1.data.command,next2.data.command].filter(Boolean);
     assert.equal(received.length,1,"Leased command delivered to exactly one poll");
@@ -158,7 +193,7 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
 
     const result = await api("POST","/android/device/commands/"+q1.data.commandId+"/result",{
       deviceId:"existing-phone",result:{ok:true,confirmed:true,locationServices:"ON",timestamp:Date.now()}
-    },deviceHeaders);
+    },repairedHeaders);
     assert.equal(result.status,200);
     const status=await api("GET","/api/devices/"+id+"/commands/"+q1.data.commandId,null,sessionHeaders);
     assert.equal(status.data.status,"CONFIRMED");
@@ -232,13 +267,10 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     const registration = await api("POST", "/api/auth/register", {
       username: "recovery-owner",
       password: "RecoveryOwner123!",
-      confirmPassword: "RecoveryOwner123!",
       deviceName: "Recovery Test Phone",
       imei: "123456789012345",
       deviceId: "jazz-recovery-test",
-      deviceToken: recoveryToken,
-      recoveryPin: "2580",
-      confirmRecoveryPin: "2580"
+      deviceToken: recoveryToken
     });
     assert.equal(registration.status, 201, "Owner registration should create account and pair device");
     assert.equal(registration.data.device.imei, "123456789012345");
@@ -254,89 +286,12 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     const duplicateRegistration = await api("POST", "/api/auth/register", {
       username: "recovery-owner",
       password: "RecoveryOwner123!",
-      confirmPassword: "RecoveryOwner123!",
       deviceName: "Another Phone",
       imei: "123456789012345",
       deviceId: "jazz-recovery-duplicate",
-      deviceToken: crypto.randomBytes(32).toString("base64url"),
-      recoveryPin: "2580",
-      confirmRecoveryPin: "2580"
+      deviceToken: crypto.randomBytes(32).toString("base64url")
     });
     assert.equal(duplicateRegistration.status, 409, "Duplicate owner usernames must be rejected");
-
-    const rejectedReset = await api("POST", "/api/auth/forgot-password", {
-      username: "recovery-owner",
-      recoveryPin: "0000",
-      newPassword: "ResetRecovery123!"
-    });
-    assert.equal(rejectedReset.status, 400, "An incorrect recovery PIN must not reset the password");
-    const passwordReset = await api("POST", "/api/auth/forgot-password", {
-      username: "recovery-owner",
-      recoveryPin: "2580",
-      newPassword: "ResetRecovery123!"
-    });
-    assert.equal(passwordReset.status, 200, "Correct recovery PIN should allow a password reset");
-    assert.equal((await api("POST", "/api/auth/login", {
-      username: "recovery-owner", password: "RecoveryOwner123!"
-    })).status, 401, "Old password must stop working after reset");
-    assert.equal((await api("POST", "/api/auth/login", {
-      username: "recovery-owner", password: "ResetRecovery123!"
-    })).status, 200, "New password should work after reset");
-    assert.equal((await api("GET", "/api/devices", null, registeredCookie)).status, 401,
-      "Password reset must invalidate existing browser sessions");
-
-    const loginAfterReset = await api("POST", "/api/auth/login", {
-      username: "recovery-owner", password: "ResetRecovery123!"
-    });
-    assert.equal(loginAfterReset.status, 200);
-    const postResetCookie = { Cookie: loginAfterReset.cookie.split(";")[0] };
-
-    const passkeyRegistrationOptions = await api("POST", "/api/auth/passkey/register/options", {}, postResetCookie);
-    assert.equal(passkeyRegistrationOptions.status, 200, "Authenticated owner should be able to start passkey enrollment");
-    assert.ok(passkeyRegistrationOptions.data.flowId);
-    assert.ok(passkeyRegistrationOptions.data.options?.challenge);
-    const persistedChallenges = await pool.query(
-      "SELECT COUNT(*)::int AS n FROM passkey_challenges WHERE user_id=(SELECT id FROM users WHERE username='recovery-owner') AND kind='register'"
-    );
-    assert.equal(persistedChallenges.rows[0].n, 1, "Passkey challenge must be stored in PostgreSQL");
-
-    const passkeyResetOptions = await api("POST", "/api/auth/password-reset/passkey/options", {
-      username: "recovery-owner"
-    });
-    assert.equal(passkeyResetOptions.status, 200);
-    assert.equal(passkeyResetOptions.data.available, false, "Account without a passkey should receive the PIN fallback");
-    const legacyPasskeyOptions = await api("POST", "/api/auth/passkey/options", {
-      username: "recovery-owner"
-    });
-    assert.equal(legacyPasskeyOptions.status, 200, "Legacy passkey-options endpoint should remain compatible");
-
-    const repairedToken = crypto.randomBytes(32).toString("base64url");
-    const repair = await api("POST", "/api/auth/device-repair", {
-      username: "recovery-owner",
-      password: "ResetRecovery123!",
-      deviceId: "jazz-recovery-test",
-      deviceToken: repairedToken,
-      deviceName: "Recovered Test Phone",
-      imei: "123456789012345"
-    });
-    assert.equal(repair.status, 200, "Authenticated repair must update the existing paired device without deleting its state");
-    const oldDeviceToken = await api("POST", "/android/device/heartbeat", {
-      deviceId: "jazz-recovery-test", status: { battery: 78 }
-    }, { Authorization: "Bearer " + recoveryToken, "X-Jazz-Lost-Device-Id": "jazz-recovery-test" });
-    assert.equal(oldDeviceToken.status, 401, "Device repair must invalidate the old token");
-    const repairedDeviceToken = await api("POST", "/android/device/heartbeat", {
-      deviceId: "jazz-recovery-test", status: { battery: 77 }
-    }, { Authorization: "Bearer " + repairedToken, "X-Jazz-Lost-Device-Id": "jazz-recovery-test" });
-    assert.equal(repairedDeviceToken.status, 200, "Repaired device token must authenticate");
-    const preservedState = await pool.query(
-      "SELECT device_name,imei FROM devices WHERE device_id=$1",
-      ["jazz-recovery-test"]
-    );
-    assert.equal(preservedState.rows[0].device_name, "Recovered Test Phone");
-    assert.equal(preservedState.rows[0].imei, "123456789012345");
-    const stillPaired = await api("GET", "/api/devices", null, postResetCookie);
-    assert.equal(stillPaired.status, 200);
-    assert.equal(stillPaired.data.items.length, 1, "Repair must preserve the existing device record and history");
 
     const changed = await runAdmin("change-owner-password",[
       ["Lost Mode username:", "new-owner"],
@@ -350,4 +305,7 @@ test("PostgreSQL-backed recovery workflows preserve owner and device credentials
     assert.equal((await api("POST","/api/auth/login",{
       username:"new-owner",password:"ReplacedPassword123!"
     })).status,200);
+  } finally {
+    try { sqlite.close(); } catch {}
+  }
 });
