@@ -1,13 +1,5 @@
-# Jazz Recovery Server
+we are using d1 db coloudflared
 
-Node.js HTTP API with PostgreSQL-only persistent storage.
-
-## Requirements
-
-- Node.js 22.5 or later.
-- PostgreSQL / Neon database.
-- Private server environment variables: `JAZZ_DB_ENGINE=postgres`, `DATABASE_URL`, `PORT=8891`, `LOST_MODE_PUBLIC_ORIGINS`, `JAZZ_DISCOUNT_CODE_PEPPER`, `JAZZ_TRIAL_CLAIM_PEPPER`, and `JAZZ_BILLING_ADMIN_BOOTSTRAP_SECRET`.
-- Use separate strong random values for each secret. Never commit `.env` or expose secrets to the website build.
 
 ## Local setup
 
